@@ -1,4 +1,4 @@
-fastapi==0.115.0
-uvicorn==0.32.0
-line-bot-sdk==3.14.2
-google-genai==0.1.1
+fastapi
+uvicorn
+line-bot-sdk
+google-genai
