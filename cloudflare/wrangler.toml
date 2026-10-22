@@ -1,0 +1,7 @@
+name = "time-ai-assistant"
+main = "src/index.js"
+compatibility_date = "2026-10-22"
+
+[vars]
+TIMEZONE = "Asia/Taipei"
+GEMINI_MODELS = "gemini-3.8-flash,gemini-3.5-flash-lite"
