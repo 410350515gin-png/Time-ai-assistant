@@ -162,11 +162,10 @@ async function processQueuedLineEvent(event, env) {
     await ensureReminderColumn(env.DB);
     await ensureRecurrenceColumn(env.DB);
     await ensureTaskTypeColumn(env.DB);
-    await ensureTaskTypeColumn(env.DB);
+    await ensureBehaviorColumns(env.DB);
     await env.DB.prepare(
       "UPDATE tasks SET task_type='routine' WHERE recurrence_json IS NOT NULL AND recurrence_json <> '' AND task_type='daily'"
     ).run();
-    await ensureTaskTypeColumn(env.DB);
   }
 
   console.log("Queue LINE text event", {
@@ -1557,11 +1556,22 @@ async function ensureSchema(db) {
       estimated_minutes INTEGER,
       recurrence_json TEXT,
       task_type TEXT NOT NULL DEFAULT 'daily',
+      stuck_count INTEGER NOT NULL DEFAULT 0,
+      last_barrier TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       reminder_sent_at TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )`,
+    `CREATE TABLE IF NOT EXISTS task_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id INTEGER NOT NULL,
+      line_user_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      event_value TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at)`,
     `CREATE INDEX IF NOT EXISTS idx_tasks_user_status ON tasks(line_user_id, status)`,
     `CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_time)`,
     `CREATE INDEX IF NOT EXISTS idx_tasks_remind ON tasks(remind_at)`
@@ -1774,6 +1784,30 @@ async function ensureTaskTypeColumn(db) {
   } catch (err) {
     const msg = String(err?.message || err);
     if (!/duplicate column name/i.test(msg)) throw err;
+  }
+}
+
+async function ensureBehaviorColumns(db) {
+  const alters = [
+    "ALTER TABLE tasks ADD COLUMN stuck_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN last_barrier TEXT"
+  ];
+  for (const sql of alters) {
+    try {
+      await db.prepare(sql).run();
+    } catch (err) {
+      const msg = String(err?.message || err);
+      if (!/duplicate column name/i.test(msg)) throw err;
+    }
+  }
+}
+
+async function logTaskEvent(db, taskId, uid, type, value = null) {
+  try {
+    await db.prepare("INSERT INTO task_events(task_id,line_user_id,event_type,event_value) VALUES (?,?,?,?)")
+      .bind(taskId, uid, type, value).run();
+  } catch (err) {
+    console.warn("Task event log failed", { task_id: taskId, type, message: String(err?.message || err) });
   }
 }
 
