@@ -1101,42 +1101,90 @@ ${message}`;
 }
 
 async function callGemini(prompt, env, jsonMode) {
-  const models = String(env.GEMINI_MODELS || "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.6-flash")
+  const configured = String(
+    env.GEMINI_MODELS || "gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.1-flash-lite"
+  )
     .split(",")
     .map(x => x.trim())
-    .filter(Boolean)
-    .slice(0, 3);
+    .filter(Boolean);
 
-  const controllers = models.map(() => new AbortController());
+  // Keep order stable and deduplicated.
+  const models = [...new Set(configured)].slice(0, 3);
+  const backoffMs = [300, 800];
+  const maxAttemptsPerModel = 2;
+  const failures = [];
 
-  const attempts = models.map((model, index) =>
-    delayedGeminiAttempt(model, index * 1500, controllers[index], prompt, env, jsonMode)
-  );
+  for (const model of models) {
+    for (let attempt = 1; attempt <= maxAttemptsPerModel; attempt++) {
+      try {
+        const text = await executeGeminiFetch(model, prompt, env, jsonMode);
 
-  try {
-    const text = await Promise.any(attempts);
-    controllers.forEach(c => c.abort());
-    return text.slice(0, 9000);
-  } catch (aggregateErr) {
-    const errors = aggregateErr?.errors || [];
-    console.error("All Gemini models failed", {
-      models,
-      errors: errors.map(e => ({
-        name: e?.name || null,
-        message: e?.message || String(e)
-      }))
-    });
-    throw errors[errors.length - 1] || aggregateErr || new Error("all Gemini models failed");
+        console.log("Gemini resilient call succeeded", {
+          model,
+          attempt
+        });
+
+        return text.slice(0, 9000);
+      } catch (err) {
+        const status = Number(err?.status || 0) || null;
+        const retryAfterMs = Number(err?.retryAfterMs || 0) || null;
+        const transient = status === 503 || status === 429 || err?.name === "AbortError";
+
+        failures.push({
+          model,
+          attempt,
+          status,
+          name: err?.name || null,
+          message: String(err?.message || err).slice(0, 300)
+        });
+
+        console.warn("Gemini resilient attempt failed", {
+          model,
+          attempt,
+          status,
+          transient,
+          retry_after_ms: retryAfterMs
+        });
+
+        // Permanent client/auth errors should not be retried across models.
+        if ([400, 401, 403].includes(status)) {
+          console.error("Gemini permanent error; aborting failover", {
+            model,
+            status
+          });
+          throw err;
+        }
+
+        const hasAnotherAttempt = attempt < maxAttemptsPerModel;
+        if (transient && hasAnotherAttempt) {
+          let delay = backoffMs[attempt - 1] || 1000;
+
+          // Respect Retry-After for 429 when present, but cap it so the bot
+          // does not feel frozen for a very long time.
+          if (status === 429 && retryAfterMs) {
+            delay = Math.min(Math.max(delay, retryAfterMs), 5000);
+          }
+
+          await sleep(delay);
+          continue;
+        }
+
+        // Move to the next model after retries are exhausted or for
+        // non-permanent errors that may be model-specific.
+        break;
+      }
+    }
   }
+
+  const finalError = new Error("All Gemini models failed after retry and failover");
+  finalError.failures = failures;
+  console.error("All Gemini models exhausted", { failures });
+  throw finalError;
 }
 
-async function delayedGeminiAttempt(model, delayMs, controller, prompt, env, jsonMode) {
-  if (delayMs > 0) {
-    await new Promise(resolve => setTimeout(resolve, delayMs));
-    if (controller.signal.aborted) throw new DOMException("Cancelled after another model succeeded", "AbortError");
-  }
-
-  const timeout = setTimeout(() => controller.abort(), 18000);
+async function executeGeminiFetch(model, prompt, env, jsonMode) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
 
   try {
     const generationConfig = {
@@ -1161,13 +1209,22 @@ async function delayedGeminiAttempt(model, delayMs, controller, prompt, env, jso
 
     if (!res.ok) {
       const detail = await res.text();
+      const retryAfter = res.headers.get("retry-after");
+      const retryAfterMs = parseRetryAfterMs(retryAfter);
+
+      const err = new Error(`${model} -> ${res.status}: ${detail.slice(0, 300)}`);
+      err.status = res.status;
+      err.retryAfterMs = retryAfterMs;
+
       console.error("Gemini HTTP error", {
         model,
         status: res.status,
         elapsed_ms: Date.now() - started,
+        retry_after_ms: retryAfterMs,
         detail: detail.slice(0, 500)
       });
-      throw new Error(`${model} -> ${res.status}: ${detail.slice(0, 300)}`);
+
+      throw err;
     }
 
     const data = await res.json();
@@ -1176,32 +1233,32 @@ async function delayedGeminiAttempt(model, delayMs, controller, prompt, env, jso
       .join("")
       .trim();
 
-    if (!text) throw new Error(`${model} returned empty response`);
-
-    console.log("Gemini model succeeded", {
-      model,
-      elapsed_ms: Date.now() - started
-    });
+    if (!text) {
+      const err = new Error(`${model} returned empty response`);
+      err.status = 502;
+      throw err;
+    }
 
     return text;
-  } catch (err) {
-    if (!(err?.name === "AbortError" && controller.signal.aborted)) {
-      console.error("Gemini model failed", {
-        model,
-        name: err?.name || null,
-        message: err?.message || String(err),
-        stack: err?.stack || null
-      });
-    } else {
-      console.error("Gemini model aborted", {
-        model,
-        timeout_or_cancel: true
-      });
-    }
-    throw err;
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function parseRetryAfterMs(value) {
+  if (!value) return null;
+
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+
+  const at = Date.parse(value);
+  if (!Number.isNaN(at)) return Math.max(0, at - Date.now());
+
+  return null;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function stripFence(text) {
