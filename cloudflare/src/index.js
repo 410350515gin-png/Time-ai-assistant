@@ -455,6 +455,54 @@ async function handleFastPath(uid, text, env) {
       : "找不到這項待辦了🐽";
   }
 
+  const stuck = s.match(/^系統：卡住任務:(\d+)$/u);
+  if (stuck) {
+    const id = Number(stuck[1]);
+    const task = await env.DB.prepare(
+      `UPDATE tasks
+       SET stuck_count=COALESCE(stuck_count,0)+1, updated_at=CURRENT_TIMESTAMP
+       WHERE id=? AND line_user_id=? AND status IN ('pending','paused')
+       RETURNING id,title,first_step,due_time,task_type,stuck_count,last_barrier`
+    ).bind(id, uid).first();
+    if (!task) return "找不到這項待辦了🐽";
+    await logTaskEvent(env.DB, id, uid, "stuck", String(task.stuck_count));
+    return buildStuckIntervention(task);
+  }
+
+  const barrier = s.match(/^系統：障礙:(\d+):(tired|unclear|time|avoid)$/u);
+  if (barrier) {
+    const id = Number(barrier[1]);
+    const kind = barrier[2];
+    const task = await env.DB.prepare(
+      `UPDATE tasks
+       SET last_barrier=?, stuck_count=CASE WHEN COALESCE(stuck_count,0) < 2 THEN 2 ELSE stuck_count END, updated_at=CURRENT_TIMESTAMP
+       WHERE id=? AND line_user_id=? AND status IN ('pending','paused')
+       RETURNING id,title,first_step,due_time,task_type,stuck_count,last_barrier`
+    ).bind(kind, id, uid).first();
+    if (!task) return "找不到這項待辦了🐽";
+    await logTaskEvent(env.DB, id, uid, "barrier", kind);
+    return buildBarrierPlan(task, kind);
+  }
+
+  const microStart = s.match(/^系統：先做五分鐘:(\d+)$/u);
+  if (microStart) {
+    const id = Number(microStart[1]);
+    const task = await env.DB.prepare(
+      "SELECT id,title,first_step FROM tasks WHERE id=? AND line_user_id=? AND status IN ('pending','paused')"
+    ).bind(id, uid).first();
+    if (!task) return "找不到這項待辦了🐽";
+    await logTaskEvent(env.DB, id, uid, "micro_start", "5m");
+    return {
+      text: `好，就只做 5 分鐘🐽\n\n👉 ${task.first_step || task.title}\n\n5 分鐘後想停也可以；現在不用處理整件事。`,
+      quickReply: {
+        items: [
+          { type: "action", action: hiddenPostbackAction("✅ 做完了", `系統：完成任務:${id}`, "這一步做完了 ✅") },
+          { type: "action", action: hiddenPostbackAction("😵 還是卡住", `系統：卡住任務:${id}`, "還是卡住了 😵") }
+        ]
+      }
+    };
+  }
+
   const done = s.match(/^系統：完成任務:(\d+)$/u);
   if (done) {
     const id = Number(done[1]);
@@ -502,6 +550,65 @@ function hiddenPostbackAction(label, data, displayText = null) {
   const action = { type: "postback", label, data };
   if (displayText) action.displayText = displayText;
   return action;
+}
+
+function hoursUntil(iso) {
+  if (!iso) return null;
+  const ms = new Date(iso).getTime() - Date.now();
+  return Number.isFinite(ms) ? ms / 3600000 : null;
+}
+
+function buildStuckIntervention(task) {
+  const count = Number(task.stuck_count || 1);
+  const first = String(task.first_step || task.title || "").trim();
+  const h = hoursUntil(task.due_time);
+
+  if (h !== null && h <= 24 && h > 0) {
+    return {
+      text: `先不追求完整，我們切成「能交出去」的版本🐽\n\n📌 ${task.title}\n👉 現在先做：${first}\n\n剩下的等這一步完成再決定。`,
+      quickReply: { items: [
+        { type: "action", action: hiddenPostbackAction("▶️ 先做5分鐘", `系統：先做五分鐘:${task.id}`, "我先做 5 分鐘 ▶️") },
+        { type: "action", action: hiddenPostbackAction("🧩 我卡住了", `系統：卡住任務:${task.id}`, "這一步我還是卡住 🧩") }
+      ] }
+    };
+  }
+
+  if (count <= 1) {
+    return {
+      text: `不用處理整件事，先把門檻降到很低🐽\n\n📌 ${task.title}\n👉 只做這一步：${first}\n\n先做 5 分鐘就算有前進。`,
+      quickReply: { items: [
+        { type: "action", action: hiddenPostbackAction("▶️ 先做5分鐘", `系統：先做五分鐘:${task.id}`, "我先做 5 分鐘 ▶️") },
+        { type: "action", action: hiddenPostbackAction("😵 還是很難", `系統：卡住任務:${task.id}`, "還是很難開始 😵") }
+      ] }
+    };
+  }
+
+  return {
+    text: `看起來不是提醒次數的問題，我們找真正卡點🐽\n「${task.title}」現在比較像哪一種？`,
+    quickReply: { items: [
+      { type: "action", action: hiddenPostbackAction("😴 太累", `系統：障礙:${task.id}:tired`, "我現在太累 😴") },
+      { type: "action", action: hiddenPostbackAction("❓ 不知怎開始", `系統：障礙:${task.id}:unclear`, "我不知道怎麼開始 ❓") },
+      { type: "action", action: hiddenPostbackAction("⏰ 時間不夠", `系統：障礙:${task.id}:time`, "我時間不夠 ⏰") },
+      { type: "action", action: hiddenPostbackAction("🙈 很不想做", `系統：障礙:${task.id}:avoid`, "我就是很不想做 🙈") }
+    ] }
+  };
+}
+
+function buildBarrierPlan(task, kind) {
+  const first = String(task.first_step || task.title || "").trim();
+  const plans = {
+    tired: `如果現在很累，就只做 5 分鐘「${first}」；5 分鐘到就可以停。`,
+    unclear: `如果不知道怎麼開始，就先只做「${first}」，不要往後想。`,
+    time: `如果今天時間真的不夠，就先做「${first}」，其餘先保留，不硬塞進今天。`,
+    avoid: `可以很不想做，同時只做 5 分鐘「${first}」。不需要先讓自己有動力。`
+  };
+  return {
+    text: `好，我們不跟卡住硬碰硬🐽\n\n${plans[kind] || plans.unclear}\n\n這次只要求「開始」，不要求一次做完。`,
+    quickReply: { items: [
+      { type: "action", action: hiddenPostbackAction("▶️ 好，先開始", `系統：先做五分鐘:${task.id}`, "好，我先開始 ▶️") },
+      { type: "action", action: hiddenPostbackAction("📅 晚點再排", `系統：延後任務:${task.id}:60`, "一小時後再提醒我 📅") }
+    ] }
+  };
 }
 
 function categoryChoiceMessage(title, target) {
