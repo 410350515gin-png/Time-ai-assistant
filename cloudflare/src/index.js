@@ -1,3 +1,4 @@
+import { REWARD_IMAGES_BASE64 } from "./rewardImages.js";
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 const YES = new Set(["是","好","確認","確認執行","同意","可以","ok","yes","好啊","照這個安排","確認計畫","好呀🐽"]);
 const NO = new Set(["否","不要","取消","不用","no","先不要","不接受","先不要🙈"]);
@@ -18,6 +19,24 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/diag") {
       return runDiagnostics(env);
+    }
+
+    const rewardMatch = url.pathname.match(/^\/reward-images\/(\d+)\.jpg$/);
+    if (request.method === "GET" && rewardMatch) {
+      const index = Number(rewardMatch[1]) - 1;
+      const base64 = REWARD_IMAGES_BASE64[index];
+      if (!base64) return new Response("Not Found", { status: 404 });
+
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+      return new Response(bytes, {
+        headers: {
+          "content-type": "image/jpeg",
+          "cache-control": "public, max-age=31536000, immutable"
+        }
+      });
     }
 
     if (request.method === "POST" && (url.pathname === "/callback" || url.pathname === "/webhook")) {
@@ -238,7 +257,7 @@ async function handleTaskMessage(uid, text, env) {
     const task = await env.DB.prepare(
       "UPDATE tasks SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? RETURNING id,title"
     ).bind(id, uid).first();
-    return task ? `✅ 已完成 #${task.id} ${task.title}` : "找不到這個任務編號。";
+    return task ? buildCompletionMessage(task, env) : "找不到這個任務編號。";
   }
 
   const context = await activeTasksContext(env.DB, uid);
@@ -252,7 +271,7 @@ async function handleTaskMessage(uid, text, env) {
     const task = await env.DB.prepare(
       "UPDATE tasks SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? RETURNING id,title"
     ).bind(result.task_id, uid).first();
-    return task ? `✅ 已完成 #${task.id} ${task.title}` : "找不到這個任務編號。";
+    return task ? buildCompletionMessage(task, env) : "找不到這個任務編號。";
   }
 
   if (result.intent === "propose_plan" || result.intent === "revise_plan") {
@@ -835,6 +854,18 @@ async function processDueReminders(env, scheduledTime) {
   }
 }
 
+function buildCompletionMessage(task, env) {
+  const base = String(
+    env.PUBLIC_BASE_URL || "https://time-ai-assistant.410350515gin.workers.dev"
+  ).replace(/\/$/, "");
+  const index = Math.floor(Math.random() * REWARD_IMAGES_BASE64.length) + 1;
+
+  return {
+    text: `做完啦！🐽✨\n${task.title}\n這項我幫你收掉了。`,
+    rewardImageUrl: `${base}/reward-images/${index}.jpg`
+  };
+}
+
 function withPlanActions(text) {
   return {
     text,
@@ -874,6 +905,18 @@ function toLineTextMessage(message) {
   return { type: "text", text: String(message || "").slice(0, 5000) };
 }
 
+function toLineMessages(message) {
+  const messages = [toLineTextMessage(message)];
+  if (message && typeof message === "object" && message.rewardImageUrl) {
+    messages.push({
+      type: "image",
+      originalContentUrl: message.rewardImageUrl,
+      previewImageUrl: message.rewardImageUrl
+    });
+  }
+  return messages;
+}
+
 async function pushLine(to, text, accessToken) {
   const res = await fetch("https://api.line.me/v2/bot/message/push", {
     method: "POST",
@@ -883,7 +926,7 @@ async function pushLine(to, text, accessToken) {
     },
     body: JSON.stringify({
       to,
-      messages: [toLineTextMessage(text)]
+      messages: toLineMessages(text)
     })
   });
 
@@ -902,7 +945,7 @@ async function replyLine(replyToken, text, accessToken) {
     },
     body: JSON.stringify({
       replyToken,
-      messages: [toLineTextMessage(text)]
+      messages: toLineMessages(text)
     })
   });
 
