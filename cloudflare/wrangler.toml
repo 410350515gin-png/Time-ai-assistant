@@ -11,3 +11,9 @@ GEMINI_MODELS = "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.6-flash"
 binding = "DB"
 database_name = "time-ai-assistant-db"
 database_id = "db4d34c0-2747-4077-a560-20b89e8aa2cd"
+
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+persist = true
