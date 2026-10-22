@@ -310,6 +310,22 @@ async function handleTaskMessage(uid, text, env) {
     return task ? buildCompletionMessage(task, env) : "找不到這個待辦任務。";
   }
 
+  if (result.intent === "change_task_type") {
+    const ids = normalizeTaskIds(result.task_ids, result.task_id);
+    const type = ["routine","goal","daily"].includes(result.task_type) ? result.task_type : null;
+    if (!ids.length || !type) return result.reply || "我還不能確定要改哪一項或改成哪一類🐽";
+
+    const placeholders = ids.map(() => "?").join(",");
+    const r = await env.DB.prepare(
+      `UPDATE tasks SET task_type=?, updated_at=CURRENT_TIMESTAMP
+       WHERE line_user_id=? AND status IN ('pending','paused') AND id IN (${placeholders})`
+    ).bind(type, uid, ...ids).run();
+
+    return Number(r?.meta?.changes || 0) > 0
+      ? `改好啦🐽 已移到 ${taskTypeLabel(type)} 任務。`
+      : "找不到符合的待辦任務🐽";
+  }
+
   if (result.intent === "delete_all_tasks") {
     await setPendingPlan(env.DB, uid, { action: "delete_all" });
     return withDeleteActions("要把目前所有待辦任務都移除嗎？\n這會停止後續提醒，但會保留歷史紀錄。");
@@ -357,12 +373,13 @@ async function handleTaskMessage(uid, text, env) {
       if (result.intent === "create_reminder") {
         const first = items[0];
         return withPlanActions(
-          `好呀🐽 我先幫你排著～\n📌 ${first.title}\n⏰ 提醒：${fmtTaipei(first.remind_at)}\n\n還沒正式存，選一下👇`
+          `好呀🐽 我先幫你排著～\n📌 ${first.title}\n🏷️ ${taskTypeLabel(first.task_type)}\n⏰ 提醒：${fmtTaipei(first.remind_at)}\n\n還沒正式存，選一下👇`,
+          items.length === 1
         );
       }
 
       const heading = "📅 我幫你整理好了🐽";
-      return withPlanActions(`${result.reply || heading}\n\n${formatPlan(items)}\n\n選一下👇`);
+      return withPlanActions(`${result.reply || heading}\n\n${formatPlan(items)}\n\n選一下👇`, items.length === 1);
     }
   }
 
@@ -379,6 +396,48 @@ async function handleFastPath(uid, text, env) {
   const categoryMatch = s.match(/^系統：任務分類:(routine|goal|daily)$/u);
   if (categoryMatch) {
     return listTasksByType(env.DB, uid, categoryMatch[1]);
+  }
+
+  if (s === "系統：改待確認分類") {
+    const pending = await getPendingPlan(env.DB, uid);
+    const items = Array.isArray(pending?.plan_items) ? pending.plan_items : [];
+    if (items.length !== 1) return "這次有多個任務，直接跟我說哪一項要改成哪一類就好🐽";
+    return categoryChoiceMessage("待確認任務", "pending");
+  }
+
+  const pendingType = s.match(/^系統：設定待確認分類:(routine|goal|daily)$/u);
+  if (pendingType) {
+    const pending = await getPendingPlan(env.DB, uid);
+    const items = Array.isArray(pending?.plan_items) ? pending.plan_items : [];
+    if (items.length !== 1) return "找不到可以修改的待確認任務🐽";
+    items[0].task_type = pendingType[1];
+    await setPendingPlan(env.DB, uid, { ...pending, plan_items: items });
+    return withPlanActions(
+      `改好啦🐽\n📌 ${items[0].title}\n🏷️ ${taskTypeLabel(items[0].task_type)}\n\n確認沒問題就存起來～`,
+      true
+    );
+  }
+
+  const changeType = s.match(/^系統：改分類:(\d+)$/u);
+  if (changeType) {
+    const id = Number(changeType[1]);
+    const task = await env.DB.prepare(
+      "SELECT id,title FROM tasks WHERE id=? AND line_user_id=? AND status IN ('pending','paused')"
+    ).bind(id, uid).first();
+    if (!task) return "找不到這項待辦了🐽";
+    return categoryChoiceMessage(task.title, id);
+  }
+
+  const setType = s.match(/^系統：設定分類:(\d+):(routine|goal|daily)$/u);
+  if (setType) {
+    const id = Number(setType[1]);
+    const type = setType[2];
+    const task = await env.DB.prepare(
+      "UPDATE tasks SET task_type=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? AND status IN ('pending','paused') RETURNING id,title"
+    ).bind(type, id, uid).first();
+    return task
+      ? `改好啦🐽 「${task.title}」已移到 ${taskTypeLabel(type)} 任務。`
+      : "找不到這項待辦了🐽";
   }
 
   const done = s.match(/^系統：完成任務:(\d+)$/u);
@@ -422,6 +481,21 @@ async function handleFastPath(uid, text, env) {
   }
 
   return null;
+}
+
+function categoryChoiceMessage(title, target) {
+  const pending = target === "pending";
+  const prefix = pending ? "系統：設定待確認分類:" : `系統：設定分類:${target}:`;
+  return {
+    text: `「${title}」要放去哪一類？🐽`,
+    quickReply: {
+      items: [
+        { type: "action", action: { type: "message", label: "🔁 例行", text: prefix + "routine" } },
+        { type: "action", action: { type: "message", label: "🎯 目標", text: prefix + "goal" } },
+        { type: "action", action: { type: "message", label: "🧺 日常", text: prefix + "daily" } }
+      ]
+    }
+  };
 }
 
 function buildTaskHubMessage() {
@@ -508,6 +582,11 @@ async function listTasksByType(db, uid, type) {
               type: "button",
               height: "sm",
               action: { type: "message", label: "完成✅", text: `系統：完成任務:${t.id}` }
+            },
+            {
+              type: "button",
+              height: "sm",
+              action: { type: "message", label: "分類🏷️", text: `系統：改分類:${t.id}` }
             },
             {
               type: "button",
@@ -975,10 +1054,19 @@ function normalizeIso(v) {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
+function taskTypeLabel(type) {
+  return {
+    routine: "🔁 例行",
+    goal: "🎯 目標",
+    daily: "🧺 日常"
+  }[type] || "🧺 日常";
+}
+
 function formatPlan(items) {
   return items.map((x, i) => {
     const bits = [
       `${i + 1}. ${x.title}`,
+      `分類 ${taskTypeLabel(x.task_type)}`,
       x.start_time ? `開始 ${fmtTaipei(x.start_time)}` : null,
       x.due_time ? `截止 ${fmtTaipei(x.due_time)}` : null,
       x.remind_at ? `提醒 ${fmtTaipei(x.remind_at)}` : null,
@@ -1067,7 +1155,8 @@ ${context || "目前沒有"}
 10. 所有自然語言意圖都由你判斷，不要求使用者記固定指令。例：「都刪掉」「清空一下」「這些不要了」可判斷為 delete_all_tasks；「把叫弟弟起床那個刪掉」為 delete_task；「這個做完了」為 complete_task。
 11. delete_task / complete_task 必須根據「現有待辦」選出真正存在的 task id。不可自行捏造 id。找不到唯一對應時，task_ids 留空，reply 說明需要使用者再指明。
 12. delete_all_tasks 只代表使用者要移除目前全部待辦，不要建立一個名為「刪除全部任務」的新任務。
-13. 使用者是在要求提醒時，intent 使用 create_reminder，並在 plan_items 中輸出真正的任務名稱與 remind_at。title 只寫行動本身，例如「去洗澡」，不要寫「提醒我去洗澡」。提醒型任務的 start_time、due_time、estimated_minutes 一律設 null。
+13. 使用者說「把 X 改成目標/日常/例行」等已儲存任務分類調整時，intent=change_task_type，從現有待辦選 task_id/task_ids，並填頂層 task_type。不要重新建立任務。
+14. 使用者是在要求提醒時，intent 使用 create_reminder，並在 plan_items 中輸出真正的任務名稱與 remind_at。title 只寫行動本身，例如「去洗澡」，不要寫「提醒我去洗澡」。提醒型任務的 start_time、due_time、estimated_minutes 一律設 null。
 14. 時間解析一律以 Asia/Taipei 為準。相對時間（例如「兩分鐘後」「半小時後」「三天後」）必須以現在台灣時間精確相加。
 15. 若使用者只是說「完成」「好了」「做完了」，優先參考現有任務與最近上下文判斷；若無法唯一判定，不要猜 task id。
 16. 若提醒時間是相對時間，例如「兩分鐘後」「半小時後」「1.5 小時後」「三天後」，你負責理解並填 time_semantics；不要自己做最終時間算術。kind=relative，amount 填數值（半小時 = 30 minute），unit 只能是 minute|hour|day|week。
@@ -1086,10 +1175,11 @@ ${context || "目前沒有"}
 
 JSON schema：
 {
-  "intent": "chat|propose_plan|revise_plan|create_reminder|list_tasks|complete_task|delete_task|delete_all_tasks",
+  "intent": "chat|propose_plan|revise_plan|create_reminder|list_tasks|complete_task|delete_task|delete_all_tasks|change_task_type",
   "reply": "給使用者看的繁體中文文字",
   "task_id": 3,
   "task_ids": [3, 7],
+  "task_type": "routine|goal|daily 或 null",
   "time_semantics": {
     "kind": "relative|absolute|none",
     "amount": 2,
@@ -1105,7 +1195,6 @@ JSON schema：
       "due_time": "ISO8601 或 null",
       "remind_at": "ISO8601 或 null",
       "estimated_minutes": 60,
-      "task_type": "routine|goal|daily",
       "task_type": "routine|goal|daily",
       "recurrence": {
         "freq": "weekly",
@@ -1153,9 +1242,10 @@ ${message}`;
     }
   }
 
-  const allowed = new Set(["chat","propose_plan","revise_plan","create_reminder","list_tasks","complete_task","delete_task","delete_all_tasks"]);
+  const allowed = new Set(["chat","propose_plan","revise_plan","create_reminder","list_tasks","complete_task","delete_task","delete_all_tasks","change_task_type"]);
   if (!allowed.has(parsed.intent)) parsed.intent = "chat";
   if (typeof parsed.reply !== "string") parsed.reply = "";
+  if (!["routine","goal","daily"].includes(parsed.task_type)) parsed.task_type = null;
   if (!Array.isArray(parsed.task_ids)) parsed.task_ids = [];
   parsed.task_ids = parsed.task_ids.map(Number).filter(Number.isInteger).slice(0, 50);
   if (parsed.task_id !== null && parsed.task_id !== undefined) {
@@ -1796,26 +1886,33 @@ function withDeleteActions(text) {
   };
 }
 
-function withPlanActions(text) {
-  return {
-    text,
-    quickReply: {
-      items: [
-        {
-          type: "action",
-          action: { type: "message", label: "好呀🐽", text: "好呀🐽" }
-        },
-        {
-          type: "action",
-          action: { type: "message", label: "我要改✏️", text: "我要改✏️" }
-        },
-        {
-          type: "action",
-          action: { type: "message", label: "先不要🙈", text: "先不要🙈" }
-        }
-      ]
+function withPlanActions(text, allowCategoryChange = false) {
+  const items = [
+    {
+      type: "action",
+      action: { type: "message", label: "好呀🐽", text: "好呀🐽" }
     }
-  };
+  ];
+
+  if (allowCategoryChange) {
+    items.push({
+      type: "action",
+      action: { type: "message", label: "🏷️ 改分類", text: "系統：改待確認分類" }
+    });
+  }
+
+  items.push(
+    {
+      type: "action",
+      action: { type: "message", label: "我要改✏️", text: "我要改✏️" }
+    },
+    {
+      type: "action",
+      action: { type: "message", label: "先不要🙈", text: "先不要🙈" }
+    }
+  );
+
+  return { text, quickReply: { items } };
 }
 
 function messageText(message) {
