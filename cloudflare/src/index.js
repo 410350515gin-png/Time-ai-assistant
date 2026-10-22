@@ -1,11 +1,18 @@
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
+const YES = new Set(["是","好","確認","確認執行","同意","可以","ok","yes","好啊","照這個安排","確認計畫"]);
+const NO = new Set(["否","不要","取消","不用","no","先不要","不接受"]);
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
-      return json({ status: "ok", runtime: "cloudflare-workers", version: "0.1" });
+      return json({
+        status: "ok",
+        runtime: "cloudflare-workers",
+        version: "0.2",
+        db_bound: Boolean(env.DB)
+      });
     }
 
     if (request.method === "GET" && url.pathname === "/diag") {
@@ -17,7 +24,7 @@ export default {
     }
 
     return new Response("Not Found", { status: 404 });
-  },
+  }
 };
 
 async function handleLineWebhook(request, env, ctx) {
@@ -46,7 +53,6 @@ async function handleLineWebhook(request, env, ctx) {
   console.log("LINE events count", events.length);
 
   ctx.waitUntil(processLineEvents(events, env));
-
   return json({ status: "accepted" });
 }
 
@@ -55,17 +61,29 @@ async function processLineEvents(events, env) {
     if (event?.type !== "message" || event?.message?.type !== "text") continue;
 
     const text = (event.message.text || "").trim();
-    console.log("LINE text event", { hasReplyToken: Boolean(event.replyToken), textLength: text.length });
     const replyToken = event.replyToken;
-    if (!text || !replyToken) continue;
+    const uid = event?.source?.userId;
+    if (!text || !replyToken || !uid) continue;
+
+    console.log("LINE text event", { hasReplyToken: true, textLength: text.length, db: Boolean(env.DB) });
+
+    if (env.DB && event.webhookEventId) {
+      const inserted = await rememberEvent(env.DB, event.webhookEventId);
+      if (!inserted) {
+        console.log("Duplicate webhook skipped", event.webhookEventId);
+        continue;
+      }
+    }
 
     let reply;
     try {
-      reply = await interpretWithGemini(text, env);
-      console.log("AI reply ready", { length: reply.length });
+      reply = env.DB
+        ? await handleTaskMessage(uid, text, env)
+        : await interpretPlainText(text, env);
+      console.log("AI/task reply ready", { length: reply.length });
     } catch (err) {
-      console.error("AI failed", err);
-      reply = "AI 服務暫時繁忙，但 LINE 連線正常。請稍後再傳一次。";
+      console.error("Message processing failed", err);
+      reply = "這次處理失敗，但 LINE 連線正常。請稍後再傳一次。";
     }
 
     try {
@@ -77,12 +95,170 @@ async function processLineEvents(events, env) {
   }
 }
 
-async function interpretWithGemini(message, env) {
-  const models = String(env.GEMINI_MODELS || "gemini-3.8-flash")
-    .split(",")
-    .map(x => x.trim())
-    .filter(Boolean);
+async function handleTaskMessage(uid, text, env) {
+  await ensureUser(env.DB, uid);
+  const lower = text.toLowerCase();
 
+  const pending = await getPendingPlan(env.DB, uid);
+  if (pending && YES.has(lower)) {
+    const items = Array.isArray(pending.plan_items) ? pending.plan_items : [];
+    const saved = await savePlanTasks(env.DB, uid, items);
+    await clearPendingPlan(env.DB, uid);
+    return `✅ 已儲存 ${saved} 項任務。你之後可以問我「列出任務」、說「完成 #3」，或再叫我重新安排。`;
+  }
+
+  if (pending && NO.has(lower)) {
+    await clearPendingPlan(env.DB, uid);
+    return "好的，這次沒有套用任何變更。";
+  }
+
+  if (/^(列出|查看|顯示).*(任務|待辦)|^(任務|待辦)(清單)?$/u.test(text)) {
+    return listTasksText(env.DB, uid);
+  }
+
+  const completeMatch = text.match(/(?:完成|做完|完成任務)\s*#?(\d+)/u);
+  if (completeMatch) {
+    const id = Number(completeMatch[1]);
+    const task = await env.DB.prepare(
+      "UPDATE tasks SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? RETURNING id,title"
+    ).bind(id, uid).first();
+    return task ? `✅ 已完成 #${task.id} ${task.title}` : "找不到這個任務編號。";
+  }
+
+  const context = await activeTasksContext(env.DB, uid);
+  const result = await interpretStructured(text, context, env);
+
+  if (result.intent === "list_tasks") {
+    return listTasksText(env.DB, uid);
+  }
+
+  if (result.intent === "complete_task" && Number.isInteger(result.task_id)) {
+    const task = await env.DB.prepare(
+      "UPDATE tasks SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? RETURNING id,title"
+    ).bind(result.task_id, uid).first();
+    return task ? `✅ 已完成 #${task.id} ${task.title}` : "找不到這個任務編號。";
+  }
+
+  if (result.intent === "propose_plan" || result.intent === "revise_plan") {
+    const items = sanitizePlanItems(result.plan_items);
+    if (items.length) {
+      await setPendingPlan(env.DB, uid, { plan_items: items });
+      return `${result.reply || "我整理好了。"}\n\n📅 建議安排（尚未儲存）：\n${formatPlan(items)}\n\n回覆「確認」才會真正寫入；也可以直接告訴我要怎麼修改，或回覆「取消」。`;
+    }
+  }
+
+  return result.reply || "請把待辦、期限或你想安排的事情告訴我。";
+}
+
+function sanitizePlanItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items
+    .filter(x => x && typeof x === "object" && x.title && x.first_step)
+    .slice(0, 20)
+    .map(x => ({
+      title: String(x.title).slice(0, 200),
+      description: x.description ? String(x.description).slice(0, 1000) : null,
+      first_step: String(x.first_step).slice(0, 500),
+      priority: Number.isFinite(Number(x.priority)) ? Math.min(5, Math.max(1, Number(x.priority))) : 3,
+      start_time: normalizeIso(x.start_time),
+      due_time: normalizeIso(x.due_time),
+      remind_at: normalizeIso(x.remind_at),
+      estimated_minutes: Number.isFinite(Number(x.estimated_minutes)) ? Math.max(1, Math.round(Number(x.estimated_minutes))) : null,
+      reason: x.reason ? String(x.reason).slice(0, 500) : ""
+    }));
+}
+
+function normalizeIso(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function formatPlan(items) {
+  return items.map((x, i) => {
+    const bits = [
+      `${i + 1}. ${x.title}`,
+      x.start_time ? `開始 ${fmtTaipei(x.start_time)}` : null,
+      x.due_time ? `截止 ${fmtTaipei(x.due_time)}` : null,
+      x.remind_at ? `提醒 ${fmtTaipei(x.remind_at)}` : null,
+      x.estimated_minutes ? `${x.estimated_minutes} 分鐘` : null
+    ].filter(Boolean);
+    return bits.join("｜") + (x.reason ? `\n   原因：${x.reason}` : "");
+  }).join("\n");
+}
+
+function fmtTaipei(v) {
+  try {
+    return new Intl.DateTimeFormat("zh-TW", {
+      timeZone: "Asia/Taipei",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false
+    }).format(new Date(v));
+  } catch {
+    return String(v);
+  }
+}
+
+async function interpretStructured(message, context, env) {
+  const prompt = `你是繁體中文的 AI 行動管家。
+你的工作是把自然語言待辦整理成可以執行的計畫。
+
+現在時間：${new Date().toISOString()}
+時區：Asia/Taipei
+
+現有待辦：
+${context || "目前沒有"}
+
+規則：
+1. 使用者一次給多個任務時，全部處理。
+2. 找出依賴關係、優先順序、第一步、合理開始時間與截止時間。
+3. 不要假裝資料已經儲存；你只能提出方案。
+4. 若資訊不足，不要亂編固定行程；可以用合理建議，但要保守。
+5. 僅輸出 JSON，不要 markdown。
+
+JSON schema：
+{
+  "intent": "chat|propose_plan|revise_plan|list_tasks|complete_task",
+  "reply": "給使用者看的繁體中文文字",
+  "task_id": 3,
+  "plan_items": [
+    {
+      "title": "任務名稱",
+      "description": "補充",
+      "first_step": "最小可執行第一步",
+      "priority": 1,
+      "start_time": "ISO8601 或 null",
+      "due_time": "ISO8601 或 null",
+      "remind_at": "ISO8601 或 null",
+      "estimated_minutes": 60,
+      "reason": "排序理由"
+    }
+  ]
+}
+
+使用者：
+${message}`;
+
+  const raw = await callGemini(prompt, env, true);
+  let parsed;
+  try {
+    parsed = JSON.parse(stripFence(raw));
+  } catch {
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (!m) throw new Error("Gemini did not return JSON");
+    parsed = JSON.parse(m[0]);
+  }
+
+  const allowed = new Set(["chat","propose_plan","revise_plan","list_tasks","complete_task"]);
+  if (!allowed.has(parsed.intent)) parsed.intent = "chat";
+  if (typeof parsed.reply !== "string") parsed.reply = "";
+  return parsed;
+}
+
+async function interpretPlainText(message, env) {
   const prompt = `你是繁體中文的行動管家。
 使用者會輸入待辦、期限、安排需求或一般問題。
 請用繁體中文直接、精簡回答。
@@ -91,6 +267,14 @@ async function interpretWithGemini(message, env) {
 
 使用者：
 ${message}`;
+  return callGemini(prompt, env, false);
+}
+
+async function callGemini(prompt, env, jsonMode) {
+  const models = String(env.GEMINI_MODELS || "gemini-3.8-flash")
+    .split(",")
+    .map(x => x.trim())
+    .filter(Boolean);
 
   let lastError;
 
@@ -99,6 +283,12 @@ ${message}`;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 12000);
 
+      const generationConfig = {
+        temperature: 0.2,
+        maxOutputTokens: jsonMode ? 2200 : 1200
+      };
+      if (jsonMode) generationConfig.responseMimeType = "application/json";
+
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`,
         {
@@ -106,10 +296,7 @@ ${message}`;
           headers: JSON_HEADERS,
           body: JSON.stringify({
             contents: [{ role: "user", parts: [{ text: prompt }] }],
-            generationConfig: {
-              temperature: 0.3,
-              maxOutputTokens: 1200
-            }
+            generationConfig
           }),
           signal: controller.signal
         }
@@ -135,7 +322,7 @@ ${message}`;
         continue;
       }
 
-      return text.slice(0, 4900);
+      return text.slice(0, 9000);
     } catch (err) {
       lastError = err;
       console.error("Gemini model failed", model, String(err));
@@ -143,6 +330,79 @@ ${message}`;
   }
 
   throw lastError || new Error("all Gemini models failed");
+}
+
+function stripFence(text) {
+  return String(text || "")
+    .replace(/^\`\`\`(?:json)?\s*/i, "")
+    .replace(/\s*\`\`\`$/, "")
+    .trim();
+}
+
+async function rememberEvent(db, eventId) {
+  const r = await db.prepare(
+    "INSERT OR IGNORE INTO webhook_events(event_id) VALUES (?)"
+  ).bind(eventId).run();
+  return Number(r?.meta?.changes || 0) > 0;
+}
+
+async function ensureUser(db, uid) {
+  await db.prepare(
+    "INSERT OR IGNORE INTO users(line_user_id) VALUES (?)"
+  ).bind(uid).run();
+}
+
+async function getPendingPlan(db, uid) {
+  const row = await db.prepare(
+    "SELECT plan_json FROM pending_plans WHERE line_user_id=?"
+  ).bind(uid).first();
+  if (!row?.plan_json) return null;
+  try { return JSON.parse(row.plan_json); } catch { return null; }
+}
+
+async function setPendingPlan(db, uid, data) {
+  await db.prepare(
+    "INSERT INTO pending_plans(line_user_id,plan_json,updated_at) VALUES (?,?,CURRENT_TIMESTAMP) ON CONFLICT(line_user_id) DO UPDATE SET plan_json=excluded.plan_json, updated_at=CURRENT_TIMESTAMP"
+  ).bind(uid, JSON.stringify(data)).run();
+}
+
+async function clearPendingPlan(db, uid) {
+  await db.prepare("DELETE FROM pending_plans WHERE line_user_id=?").bind(uid).run();
+}
+
+async function savePlanTasks(db, uid, items) {
+  const clean = sanitizePlanItems(items);
+  if (!clean.length) return 0;
+  const stmts = clean.map(x => db.prepare(
+    `INSERT INTO tasks(
+      line_user_id,title,description,first_step,priority,start_time,due_time,remind_at,estimated_minutes,status
+    ) VALUES (?,?,?,?,?,?,?,?,?,'pending')`
+  ).bind(
+    uid, x.title, x.description, x.first_step, x.priority,
+    x.start_time, x.due_time, x.remind_at, x.estimated_minutes
+  ));
+  const results = await db.batch(stmts);
+  return results.reduce((n, r) => n + Number(r?.meta?.changes || 0), 0);
+}
+
+async function activeTasksContext(db, uid) {
+  const r = await db.prepare(
+    "SELECT id,title,status,start_time,due_time,first_step FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') ORDER BY COALESCE(due_time,'9999-12-31'), priority ASC LIMIT 40"
+  ).bind(uid).all();
+  return (r.results || []).map(t =>
+    `id=${t.id};title=${t.title};status=${t.status};start=${t.start_time || ""};due=${t.due_time || ""};first_step=${t.first_step || ""}`
+  ).join("\n");
+}
+
+async function listTasksText(db, uid) {
+  const r = await db.prepare(
+    "SELECT id,title,status,due_time FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') ORDER BY COALESCE(due_time,'9999-12-31'), priority ASC LIMIT 50"
+  ).bind(uid).all();
+  const rows = r.results || [];
+  if (!rows.length) return "目前沒有待處理任務。";
+  return "🟡 待處理：\n" + rows.map(t =>
+    `#${t.id} ${t.title}｜${t.status}${t.due_time ? `｜截止 ${fmtTaipei(t.due_time)}` : ""}`
+  ).join("\n");
 }
 
 async function replyLine(replyToken, text, accessToken) {
@@ -179,7 +439,6 @@ async function verifyLineSignature(body, signature, secret) {
   let binary = "";
   for (const b of bytes) binary += String.fromCharCode(b);
   const expected = btoa(binary);
-
   return timingSafeEqual(expected, signature);
 }
 
@@ -194,18 +453,30 @@ function json(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: JSON_HEADERS });
 }
 
-
 async function runDiagnostics(env) {
   const result = {
     runtime: "cloudflare-workers",
+    version: "0.2",
+    db_bound: Boolean(env.DB),
     secrets: {
       GEMINI_API_KEY: Boolean(env.GEMINI_API_KEY),
       CHANNEL_SECRET: Boolean(env.CHANNEL_SECRET),
       CHANNEL_ACCESS_TOKEN: Boolean(env.CHANNEL_ACCESS_TOKEN)
     },
     gemini: { ok: false, model: null, status: null },
-    line: { ok: false, status: null }
+    line: { ok: false, status: null },
+    db: { ok: false, status: env.DB ? "bound" : "not_bound" }
   };
+
+  if (env.DB) {
+    try {
+      const row = await env.DB.prepare("SELECT 1 AS ok").first();
+      result.db.ok = row?.ok === 1;
+      result.db.status = result.db.ok ? "ok" : "query_failed";
+    } catch (err) {
+      result.db.status = String(err?.message || err);
+    }
+  }
 
   const models = String(env.GEMINI_MODELS || "gemini-3.8-flash")
     .split(",")
