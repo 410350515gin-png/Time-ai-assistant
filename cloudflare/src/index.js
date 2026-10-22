@@ -713,6 +713,18 @@ async function listTasksByType(db, uid, type) {
             {
               type: "button",
               height: "sm",
+              action: hiddenPostbackAction("🧩 卡住", `系統：卡住任務:${t.id}`, `「${String(t.title || "").slice(0, 30)}」卡住了 🧩`)
+            }
+          ]
+        },
+        {
+          type: "box",
+          layout: "horizontal",
+          spacing: "sm",
+          contents: [
+            {
+              type: "button",
+              height: "sm",
               action: hiddenPostbackAction("🏷 分類", `系統：改分類:${t.id}`, `修改「${String(t.title || "").slice(0, 40)}」分類 🏷️`)
             },
             {
