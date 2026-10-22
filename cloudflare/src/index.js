@@ -765,12 +765,19 @@ ${context || "目前沒有"}
 7. 「下午」預設代表 13:00–17:59；若使用者只說下午，不要排到晚上。
 8. 「週五前」代表最晚必須在本週五當天完成，不可排到週六或週日；若今天已經是週五，則視情況安排今天完成。
 9. 若使用者明確給截止日，due_time 不得晚於該截止日。
+10. 所有自然語言意圖都由你判斷，不要求使用者記固定指令。例：「都刪掉」「清空一下」「這些不要了」可判斷為 delete_all_tasks；「把叫弟弟起床那個刪掉」為 delete_task；「這個做完了」為 complete_task。
+11. delete_task / complete_task 必須根據「現有待辦」選出真正存在的 task id。不可自行捏造 id。找不到唯一對應時，task_ids 留空，reply 說明需要使用者再指明。
+12. delete_all_tasks 只代表使用者要移除目前全部待辦，不要建立一個名為「刪除全部任務」的新任務。
+13. 使用者是在要求提醒時，intent 使用 create_reminder，並在 plan_items 中輸出真正的任務名稱與 remind_at。
+14. 時間解析一律以 Asia/Taipei 為準。相對時間（例如「兩分鐘後」「半小時後」「三天後」）必須以現在台灣時間精確相加。
+15. 若使用者只是說「完成」「好了」「做完了」，優先參考現有任務與最近上下文判斷；若無法唯一判定，不要猜 task id。
 
 JSON schema：
 {
-  "intent": "chat|propose_plan|revise_plan|list_tasks|complete_task",
+  "intent": "chat|propose_plan|revise_plan|create_reminder|list_tasks|complete_task|delete_task|delete_all_tasks",
   "reply": "給使用者看的繁體中文文字",
   "task_id": 3,
+  "task_ids": [3, 7],
   "plan_items": [
     {
       "title": "任務名稱",
@@ -819,9 +826,17 @@ ${message}`;
     }
   }
 
-  const allowed = new Set(["chat","propose_plan","revise_plan","list_tasks","complete_task"]);
+  const allowed = new Set(["chat","propose_plan","revise_plan","create_reminder","list_tasks","complete_task","delete_task","delete_all_tasks"]);
   if (!allowed.has(parsed.intent)) parsed.intent = "chat";
   if (typeof parsed.reply !== "string") parsed.reply = "";
+  if (!Array.isArray(parsed.task_ids)) parsed.task_ids = [];
+  parsed.task_ids = parsed.task_ids.map(Number).filter(Number.isInteger).slice(0, 50);
+  if (parsed.task_id !== null && parsed.task_id !== undefined) {
+    const n = Number(parsed.task_id);
+    parsed.task_id = Number.isInteger(n) ? n : null;
+  } else {
+    parsed.task_id = null;
+  }
   return parsed;
 }
 
