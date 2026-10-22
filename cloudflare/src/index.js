@@ -220,6 +220,13 @@ async function handleTaskMessage(uid, text, env) {
     return listTasksText(env.DB, uid);
   }
 
+  const relativeReminder = parseRelativeReminder(text);
+  if (relativeReminder) {
+    await setPendingPlan(env.DB, uid, { plan_items: [relativeReminder] });
+    return `⏰ 好，我先幫你設好：${relativeReminder.title}\n提醒時間：${fmtTaipei(relativeReminder.remind_at)}\n\n目前尚未儲存，回覆「確認」後才會正式建立。`;
+  }
+
+
   const completeMatch = text.match(/(?:完成|做完|完成任務)\s*#?(\d+)/u);
   if (completeMatch) {
     const id = Number(completeMatch[1]);
@@ -252,6 +259,34 @@ async function handleTaskMessage(uid, text, env) {
   }
 
   return result.reply || "請把待辦、期限或你想安排的事情告訴我。";
+}
+
+function parseRelativeReminder(text) {
+  const s = String(text || "").trim();
+  const m = s.match(/(?:^|\s)(\d+)\s*(分鐘|小時)後提醒我\s*(.+)$/u);
+  if (!m) return null;
+
+  const amount = Number(m[1]);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+
+  const unit = m[2];
+  const title = m[3].trim().replace(/[。！!]+$/u, "");
+  if (!title) return null;
+
+  const ms = unit === "小時" ? amount * 60 * 60 * 1000 : amount * 60 * 1000;
+  const when = new Date(Date.now() + ms).toISOString();
+
+  return {
+    title: title.slice(0, 200),
+    description: `相對時間提醒：${amount}${unit}後`,
+    first_step: title.slice(0, 500),
+    priority: 1,
+    start_time: when,
+    due_time: when,
+    remind_at: when,
+    estimated_minutes: null,
+    reason: `依照使用者指定的「${amount}${unit}後」精準計算，不交由 AI 推算。`
+  };
 }
 
 function sanitizePlanItems(items) {
