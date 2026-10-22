@@ -320,8 +320,9 @@ async function handleTaskMessage(uid, text, env) {
 
     const id = ids[0];
     const task = await env.DB.prepare(
-      "UPDATE tasks SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? AND status IN ('pending','paused') RETURNING id,title"
+      "UPDATE tasks SET status='completed', stuck_count=0, last_barrier=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? AND status IN ('pending','paused') RETURNING id,title"
     ).bind(id, uid).first();
+    if (task) await logTaskEvent(env.DB, id, uid, "completed");
     return task ? buildCompletionMessage(task, env) : "找不到這個待辦任務。";
   }
 
@@ -507,8 +508,9 @@ async function handleFastPath(uid, text, env) {
   if (done) {
     const id = Number(done[1]);
     const task = await env.DB.prepare(
-      "UPDATE tasks SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? AND status IN ('pending','paused') RETURNING id,title"
+      "UPDATE tasks SET status='completed', stuck_count=0, last_barrier=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? AND status IN ('pending','paused') RETURNING id,title"
     ).bind(id, uid).first();
+    if (task) await logTaskEvent(env.DB, id, uid, "completed");
     return task ? buildCompletionMessage(task, env) : "這項好像已經處理掉了🐽";
   }
 
@@ -1962,6 +1964,10 @@ async function processDueReminders(env, scheduledTime) {
           {
             type: "action",
             action: hiddenPostbackAction("完成了✅", `系統：完成任務:${task.id}`, `完成「${String(task.title || "").slice(0, 40)}」✅`)
+          },
+          {
+            type: "action",
+            action: hiddenPostbackAction("卡住了🧩", `系統：卡住任務:${task.id}`, `「${String(task.title || "").slice(0, 30)}」卡住了 🧩`)
           }
         ]
       }
