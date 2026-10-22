@@ -151,6 +151,7 @@ async function processQueuedLineEvent(event, env) {
     await ensureReminderColumn(env.DB);
     await ensureRecurrenceColumn(env.DB);
     await ensureTaskTypeColumn(env.DB);
+    await ensureTaskTypeColumn(env.DB);
     await env.DB.prepare(
       "UPDATE tasks SET task_type='routine' WHERE recurrence_json IS NOT NULL AND recurrence_json <> '' AND task_type='daily'"
     ).run();
@@ -1040,6 +1041,12 @@ function sanitizePlanItems(items) {
     }));
 }
 
+function sanitizeTaskType(v, recurrence = null) {
+  if (recurrence) return "routine";
+  const type = String(v || "").toLowerCase();
+  return ["routine","goal","daily"].includes(type) ? type : "daily";
+}
+
 function sanitizeRecurrence(v) {
   if (!v || typeof v !== "object") return null;
   const freq = String(v.freq || "").toLowerCase();
@@ -1175,6 +1182,11 @@ ${context || "目前沒有"}
 19. 使用者描述固定課表、每週、每天、每月、固定週期時，可以在 plan_items.recurrence 填週期設定；不要把未來每一次全部展開成很多筆任務。
 20. 使用者一次給多項行程時，你仍要先幫他比較衝突、優先順序、空檔與負荷，必要時提出較合理的時間安排；除非使用者明確要求立即建立，否則先提出完整方案讓他確認。
 21. recurrence 格式：freq 只能 daily|weekly|monthly；weekdays 用 0=週日...6=週六；time 用 HH:MM；monthly 可用 day_of_month。
+22. 每個 plan_item 都必須分類 task_type：
+- routine：固定課表、每天/每週/每月重複、固定習慣。
+- goal：報告、考試準備、專案、申請、長期目標或需要多步驟推進的任務。
+- daily：洗衣、洗澡、拿包裹、回電話、單次生活雜事。
+若有 recurrence，task_type 必須是 routine。
 22. 每個任務都要分類 task_type：routine=固定重複的例行任務/課表/固定習慣；goal=有成果、截止或需要多步驟推進的目標/報告/專案；daily=一次性的日常瑣事，例如洗衣、洗澡、拿包裹。
 23. 有 recurrence 的任務原則上 task_type=routine。
 
@@ -1618,7 +1630,7 @@ function taskHubMessage() {
 async function listTasksText(db, uid, taskType = null) {
   const r = await db.prepare(
     taskType
-      ? "SELECT id,title,status,due_time,remind_at FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') AND task_type=? ORDER BY COALESCE(due_time,remind_at,'9999-12-31'), priority ASC LIMIT 20"
+      ? "SELECT id,title,status,due_time,remind_at,task_type FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') AND task_type=? ORDER BY COALESCE(due_time,remind_at,'9999-12-31'), priority ASC LIMIT 20"
       : "SELECT id,title,status,due_time,remind_at FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') ORDER BY COALESCE(due_time,remind_at,'9999-12-31'), priority ASC LIMIT 20"
   );
   const query = taskType ? r.bind(uid, taskType) : r.bind(uid);
