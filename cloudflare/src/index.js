@@ -252,6 +252,45 @@ async function handleTaskMessage(uid, text, env) {
     return listTasksText(env.DB, uid);
   }
 
+  if (/^(全部刪除|刪除全部|刪除全部任務|全部任務刪除|清空任務|清空待辦|清空全部任務)$/u.test(text)) {
+    return {
+      text: "要把目前所有待辦任務都移除嗎？\n這會停止之後的提醒，但我會保留歷史紀錄。",
+      quickReply: {
+        items: [
+          {
+            type: "action",
+            action: { type: "message", label: "確定刪除🗑️", text: "確認刪除全部任務" }
+          },
+          {
+            type: "action",
+            action: { type: "message", label: "先不要🙈", text: "取消刪除全部任務" }
+          }
+        ]
+      }
+    };
+  }
+
+  if (text === "確認刪除全部任務") {
+    const r = await env.DB.prepare(
+      "UPDATE tasks SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE line_user_id=? AND status IN ('pending','paused')"
+    ).bind(uid).run();
+    const n = Number(r?.meta?.changes || 0);
+    return `🗑️ 已移除 ${n} 項待辦任務，後續提醒也會停止。`;
+  }
+
+  if (text === "取消刪除全部任務") {
+    return "好～先保留目前的任務🙈";
+  }
+
+  const deleteMatch = text.match(/^(?:刪除|移除|取消任務)\s*#?(\d+)$/u);
+  if (deleteMatch) {
+    const id = Number(deleteMatch[1]);
+    const task = await env.DB.prepare(
+      "UPDATE tasks SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? AND status IN ('pending','paused') RETURNING id,title"
+    ).bind(id, uid).first();
+    return task ? `🗑️ 已移除「${task.title}」，之後不會再提醒。` : "找不到這個待辦任務。";
+  }
+
   const smartReminder = await resolveReminderIntent(text, env);
   if (smartReminder) {
     await setPendingPlan(env.DB, uid, { plan_items: [smartReminder] });
