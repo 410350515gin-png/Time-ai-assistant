@@ -175,7 +175,9 @@ function sanitizePlanItems(items) {
       start_time: normalizeIso(x.start_time),
       due_time: normalizeIso(x.due_time),
       remind_at: normalizeIso(x.remind_at),
-      estimated_minutes: Number.isFinite(Number(x.estimated_minutes)) ? Math.max(1, Math.round(Number(x.estimated_minutes))) : null,
+      estimated_minutes: x.estimated_minutes !== null && x.estimated_minutes !== undefined && x.estimated_minutes !== "" && Number.isFinite(Number(x.estimated_minutes))
+        ? Math.max(1, Math.round(Number(x.estimated_minutes)))
+        : null,
       reason: x.reason ? String(x.reason).slice(0, 500) : ""
     }));
 }
@@ -344,79 +346,107 @@ ${message}`;
 }
 
 async function callGemini(prompt, env, jsonMode) {
-  const models = String(env.GEMINI_MODELS || "gemini-3.8-flash")
+  const models = String(env.GEMINI_MODELS || "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.6-flash")
     .split(",")
     .map(x => x.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .slice(0, 3);
 
-  let lastError;
+  const controllers = models.map(() => new AbortController());
 
-  for (const model of models) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000);
+  const attempts = models.map((model, index) =>
+    delayedGeminiAttempt(model, index * 1500, controllers[index], prompt, env, jsonMode)
+  );
 
-      const generationConfig = {
-        temperature: 0.2,
-        maxOutputTokens: jsonMode ? 1200 : 900
-      };
-      if (jsonMode) generationConfig.responseMimeType = "application/json";
+  try {
+    const text = await Promise.any(attempts);
+    controllers.forEach(c => c.abort());
+    return text.slice(0, 9000);
+  } catch (aggregateErr) {
+    const errors = aggregateErr?.errors || [];
+    console.error("All Gemini models failed", {
+      models,
+      errors: errors.map(e => ({
+        name: e?.name || null,
+        message: e?.message || String(e)
+      }))
+    });
+    throw errors[errors.length - 1] || aggregateErr || new Error("all Gemini models failed");
+  }
+}
 
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`,
-        {
-          method: "POST",
-          headers: JSON_HEADERS,
-          body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: prompt }] }],
-            generationConfig
-          }),
-          signal: controller.signal
-        }
-      );
+async function delayedGeminiAttempt(model, delayMs, controller, prompt, env, jsonMode) {
+  if (delayMs > 0) {
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+    if (controller.signal.aborted) throw new DOMException("Cancelled after another model succeeded", "AbortError");
+  }
 
-      clearTimeout(timeout);
+  const timeout = setTimeout(() => controller.abort(), 18000);
 
-      if (!res.ok) {
-        const detail = await res.text();
-        console.error("Gemini HTTP error", {
-          model,
-          status: res.status,
-          detail: detail.slice(0, 500)
-        });
-        lastError = new Error(`${model} -> ${res.status}: ${detail.slice(0, 300)}`);
-        if ([429, 500, 502, 503, 504].includes(res.status)) continue;
-        throw lastError;
+  try {
+    const generationConfig = {
+      temperature: 0.2,
+      maxOutputTokens: jsonMode ? 1200 : 900
+    };
+    if (jsonMode) generationConfig.responseMimeType = "application/json";
+
+    const started = Date.now();
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`,
+      {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig
+        }),
+        signal: controller.signal
       }
+    );
 
-      const data = await res.json();
-      const text = data?.candidates?.[0]?.content?.parts
-        ?.map(p => p?.text || "")
-        .join("")
-        .trim();
+    if (!res.ok) {
+      const detail = await res.text();
+      console.error("Gemini HTTP error", {
+        model,
+        status: res.status,
+        elapsed_ms: Date.now() - started,
+        detail: detail.slice(0, 500)
+      });
+      throw new Error(`${model} -> ${res.status}: ${detail.slice(0, 300)}`);
+    }
 
-      if (!text) {
-        lastError = new Error(`${model} returned empty response`);
-        continue;
-      }
+    const data = await res.json();
+    const text = data?.candidates?.[0]?.content?.parts
+      ?.map(p => p?.text || "")
+      .join("")
+      .trim();
 
-      return text.slice(0, 9000);
-    } catch (err) {
-      lastError = err;
+    if (!text) throw new Error(`${model} returned empty response`);
+
+    console.log("Gemini model succeeded", {
+      model,
+      elapsed_ms: Date.now() - started
+    });
+
+    return text;
+  } catch (err) {
+    if (!(err?.name === "AbortError" && controller.signal.aborted)) {
       console.error("Gemini model failed", {
         model,
         name: err?.name || null,
         message: err?.message || String(err),
         stack: err?.stack || null
       });
+    } else {
+      console.error("Gemini model aborted", {
+        model,
+        timeout_or_cancel: true
+      });
     }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  console.error("All Gemini models failed", {
-    name: lastError?.name || null,
-    message: lastError?.message || String(lastError || "unknown")
-  });
-  throw lastError || new Error("all Gemini models failed");
 }
 
 function stripFence(text) {
