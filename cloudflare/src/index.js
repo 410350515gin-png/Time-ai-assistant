@@ -28,6 +28,29 @@ export default {
 
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(processDueReminders(env, controller.scheduledTime));
+  },
+
+  async queue(batch, env) {
+    for (const message of batch.messages) {
+      try {
+        const body = message.body || {};
+        if (body.type !== "LINE_EVENT" || !body.event) {
+          console.warn("Unknown queue message", { type: body.type || null });
+          message.ack();
+          continue;
+        }
+
+        await processQueuedLineEvent(body.event, env);
+        message.ack();
+      } catch (err) {
+        console.error("Queue processing failed", {
+          name: err?.name || null,
+          message: err?.message || String(err),
+          stack: err?.stack || null
+        });
+        message.retry({ delaySeconds: 30 });
+      }
+    }
   }
 };
 
@@ -56,8 +79,73 @@ async function handleLineWebhook(request, env, ctx) {
   const events = Array.isArray(body.events) ? body.events : [];
   console.log("LINE events count", events.length);
 
-  ctx.waitUntil(processLineEvents(events, env));
-  return json({ status: "accepted" });
+  if (!env.GEMINI_QUEUE) {
+    console.error("GEMINI_QUEUE binding missing");
+    return json({ error: "queue unavailable" }, 503);
+  }
+
+  try {
+    for (const event of events) {
+      await env.GEMINI_QUEUE.send({
+        type: "LINE_EVENT",
+        event,
+        enqueued_at: Date.now()
+      });
+    }
+  } catch (err) {
+    console.error("Queue enqueue failed", {
+      name: err?.name || null,
+      message: err?.message || String(err)
+    });
+    return json({ error: "queue enqueue failed" }, 503);
+  }
+
+  return json({ status: "queued", count: events.length });
+}
+
+async function processQueuedLineEvent(event, env) {
+  if (event?.type !== "message" || event?.message?.type !== "text") return;
+
+  const text = (event.message.text || "").trim();
+  const uid = event?.source?.userId;
+  if (!text || !uid) return;
+
+  if (env.DB) {
+    await ensureSchema(env.DB);
+    await ensureReminderColumn(env.DB);
+  }
+
+  console.log("Queue LINE text event", {
+    textLength: text.length,
+    db: Boolean(env.DB),
+    webhookEventId: event.webhookEventId || null
+  });
+
+  if (env.DB && event.webhookEventId) {
+    const inserted = await rememberEvent(env.DB, event.webhookEventId);
+    if (!inserted) {
+      console.log("Duplicate queued webhook skipped", event.webhookEventId);
+      return;
+    }
+  }
+
+  let reply;
+  try {
+    reply = env.DB
+      ? await handleTaskMessage(uid, text, env)
+      : await interpretPlainText(text, env);
+    console.log("Queue AI/task reply ready", { length: reply.length });
+  } catch (err) {
+    console.error("Queued message processing failed", {
+      name: err?.name || null,
+      message: err?.message || String(err),
+      stack: err?.stack || null
+    });
+    throw err;
+  }
+
+  await pushLine(uid, reply, env.CHANNEL_ACCESS_TOKEN);
+  console.log("LINE push sent from queue");
 }
 
 async function processLineEvents(events, env) {
