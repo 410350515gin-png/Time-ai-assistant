@@ -301,29 +301,31 @@ async function handleTaskMessage(uid, text, env) {
     return "可以呀✏️ 直接用你平常說話的方式告訴我想怎麼改。";
   }
 
-  const incompleteReply = /^(還沒|還沒有|還沒做|還沒完成|還沒開始|尚未|還沒弄|還沒用)$/u.test(String(text || "").trim());
-  if (!pending && incompleteReply) {
-    const recent = await findRecentRemindedTask(env.DB, uid);
-    if (recent) {
-      const task = await markTaskStuck(env.DB, uid, Number(recent.id), "natural_incomplete");
-      if (task) return buildStuckIntervention(task);
-    }
-  }
-
   const fast = await handleFastPath(uid, text, env);
   if (fast) return fast;
 
   const activeContext = await activeTasksContext(env.DB, uid);
+  const recentReminderContext = await recentRemindersContext(env.DB, uid);
   const pendingContext = pending?.plan_items?.length
     ? "\n\n尚未確認的方案：\n" + pending.plan_items.map((x, i) =>
         `proposal_${i + 1};title=${x.title || ""};start=${x.start_time || ""};due=${x.due_time || ""};remind=${x.remind_at || ""};first_step=${x.first_step || ""}`
       ).join("\n")
     : "";
-  const context = activeContext + pendingContext;
+  const context = activeContext + recentReminderContext + pendingContext;
   const result = await interpretStructured(text, context, env);
 
   if (result.intent === "list_tasks") {
     return buildTaskHubMessage();
+  }
+
+  if (result.intent === "task_stuck") {
+    const ids = normalizeTaskIds(result.task_ids, result.task_id);
+    if (!ids.length) return result.reply || "我知道你現在還沒完成，但我不敢猜是哪一項🐽";
+
+    const id = ids[0];
+    const task = await markTaskStuck(env.DB, uid, id, "ai_context");
+    if (!task) return "找不到這項待辦了🐽";
+    return buildStuckIntervention(task);
   }
 
   if (result.intent === "complete_task") {
@@ -412,6 +414,28 @@ async function handleTaskMessage(uid, text, env) {
   }
 
   return result.reply || "我有收到，但目前還不能安全判斷你想執行哪個操作。";
+}
+
+async function recentRemindersContext(db, uid) {
+  const r = await db.prepare(
+    `SELECT t.id,t.title,t.first_step,t.due_time,e.created_at
+     FROM task_events e
+     JOIN tasks t ON t.id=e.task_id
+     WHERE e.line_user_id=?
+       AND e.event_type='reminder_sent'
+       AND e.created_at >= datetime('now','-6 hours')
+       AND t.status IN ('pending','paused')
+     ORDER BY e.created_at DESC
+     LIMIT 5`
+  ).bind(uid).all();
+
+  const rows = r.results || [];
+  if (!rows.length) return "";
+
+  return "\n\n最近提醒過的任務（只作為對話情境，不代表使用者一定在回覆它）：\n" +
+    rows.map(x =>
+      `recent_reminder;id=${x.id};title=${x.title};sent_at=${x.created_at || ""};due=${x.due_time || ""};first_step=${x.first_step || ""}`
+    ).join("\n");
 }
 
 async function findRecentRemindedTask(db, uid) {
@@ -1413,6 +1437,8 @@ ${context || "目前沒有"}
 8. 「週五前」代表最晚必須在本週五當天完成，不可排到週六或週日；若今天已經是週五，則視情況安排今天完成。
 9. 若使用者明確給截止日，due_time 不得晚於該截止日。
 10. 所有自然語言意圖都由你判斷，不要求使用者記固定指令。例：「都刪掉」「清空一下」「這些不要了」可判斷為 delete_all_tasks；「把叫弟弟起床那個刪掉」為 delete_task；「這個做完了」為 complete_task。
+10a. 若使用者是在回應最近的任務提醒，語意表示「尚未完成、做不下去、卡住、沒有開始、目前還做不到」等，不論他用了什麼說法，都使用 intent=task_stuck，並依「最近提醒過的任務」與「現有待辦」找出真正 task id。不要靠固定關鍵字判斷。
+10b. 短句必須結合上下文理解。例如「還不行」「等等」「我根本沒動」「不想弄」「還在拖」「沒做到」可能是 task_stuck，也可能只是一般聊天；只有上下文足夠指向某個待辦時才回 task_stuck。若無法唯一判斷，task_ids 留空，不可猜測。
 11. delete_task / complete_task 必須根據「現有待辦」選出真正存在的 task id。不可自行捏造 id。找不到唯一對應時，task_ids 留空，reply 說明需要使用者再指明。
 12. delete_all_tasks 只代表使用者要移除目前全部待辦，不要建立一個名為「刪除全部任務」的新任務。
 13. 使用者說「把 X 改成目標/日常/例行」等已儲存任務分類調整時，intent=change_task_type，從現有待辦選 task_id/task_ids，並填頂層 task_type。不要重新建立任務。
@@ -1436,7 +1462,7 @@ ${context || "目前沒有"}
 
 JSON schema：
 {
-  "intent": "chat|propose_plan|revise_plan|create_reminder|list_tasks|complete_task|delete_task|delete_all_tasks|change_task_type",
+  "intent": "chat|propose_plan|revise_plan|create_reminder|list_tasks|complete_task|task_stuck|delete_task|delete_all_tasks|change_task_type",
   "reply": "給使用者看的繁體中文文字",
   "task_id": 3,
   "task_ids": [3, 7],
@@ -1503,7 +1529,7 @@ ${message}`;
     }
   }
 
-  const allowed = new Set(["chat","propose_plan","revise_plan","create_reminder","list_tasks","complete_task","delete_task","delete_all_tasks","change_task_type"]);
+  const allowed = new Set(["chat","propose_plan","revise_plan","create_reminder","list_tasks","complete_task","task_stuck","delete_task","delete_all_tasks","change_task_type"]);
   if (!allowed.has(parsed.intent)) parsed.intent = "chat";
   if (typeof parsed.reply !== "string") parsed.reply = "";
   if (!["routine","goal","daily"].includes(parsed.task_type)) parsed.task_type = null;
