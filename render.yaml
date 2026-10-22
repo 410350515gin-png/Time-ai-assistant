@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: Time-ai-assistant
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: TIMEZONE
+        value: Asia/Taipei
+      - key: DATABASE_URL
+        fromDatabase:
+          name: time-ai-assistant-db
+          property: connectionString
+  - type: worker
+    name: Time-ai-assistant-worker
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python worker.py
+    envVars:
+      - key: TIMEZONE
+        value: Asia/Taipei
+      - key: DATABASE_URL
+        fromDatabase:
+          name: time-ai-assistant-db
+          property: connectionString
+databases:
+  - name: time-ai-assistant-db
+    plan: basic-256mb
+    postgresMajorVersion: 16
