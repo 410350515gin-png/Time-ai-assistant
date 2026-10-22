@@ -459,6 +459,68 @@ async function handleFastPath(uid, text, env) {
       : "找不到這項待辦了🐽";
   }
 
+  const mood = s.match(/^系統：晚間心情:(\d{4}-\d{2}-\d{2}):(great|good|neutral|tired|low)$/u);
+  if (mood) {
+    const dateKey = mood[1];
+    const value = mood[2];
+    await env.DB.prepare(
+      `INSERT INTO daily_checkins(line_user_id,date_key,mood,responded_at)
+       VALUES (?,?,?,CURRENT_TIMESTAMP)
+       ON CONFLICT(line_user_id,date_key) DO UPDATE
+       SET mood=excluded.mood, responded_at=CURRENT_TIMESTAMP`
+    ).bind(uid, dateKey, value).run();
+
+    const labels = {
+      great: "很不錯 😄",
+      good: "還可以 🙂",
+      neutral: "普通 😐",
+      tired: "有點累 😮‍💨",
+      low: "很低落 😞"
+    };
+
+    return {
+      text: `記下來了🐽 今天是「${labels[value]}」。\n如果願意，再選一個今天最明顯的感受；不想填也可以直接收工。`,
+      quickReply: {
+        items: [
+          { type: "action", action: hiddenPostbackAction("✨ 有成就感", `系統：晚間情緒:${dateKey}:accomplished`, "✨ 今天有成就感") },
+          { type: "action", action: hiddenPostbackAction("🌿 平靜", `系統：晚間情緒:${dateKey}:calm`, "🌿 今天比較平靜") },
+          { type: "action", action: hiddenPostbackAction("😵‍💫 焦慮", `系統：晚間情緒:${dateKey}:anxious`, "😵‍💫 今天有點焦慮") },
+          { type: "action", action: hiddenPostbackAction("🪫 疲累", `系統：晚間情緒:${dateKey}:exhausted`, "🪫 今天很疲累") },
+          { type: "action", action: hiddenPostbackAction("😤 煩躁", `系統：晚間情緒:${dateKey}:irritable`, "😤 今天有點煩躁") },
+          { type: "action", action: hiddenPostbackAction("🌧️ 低落", `系統：晚間情緒:${dateKey}:down`, "🌧️ 今天有點低落") },
+          { type: "action", action: hiddenPostbackAction("收工🐽", `系統：晚間情緒:${dateKey}:skip`, "今天先到這裡 🐽") }
+        ]
+      }
+    };
+  }
+
+  const emotion = s.match(/^系統：晚間情緒:(\d{4}-\d{2}-\d{2}):(accomplished|calm|anxious|exhausted|irritable|down|skip)$/u);
+  if (emotion) {
+    const dateKey = emotion[1];
+    const tag = emotion[2];
+
+    if (tag !== "skip") {
+      await env.DB.prepare(
+        `INSERT INTO daily_checkins(line_user_id,date_key,emotion_tag,responded_at)
+         VALUES (?,?,?,CURRENT_TIMESTAMP)
+         ON CONFLICT(line_user_id,date_key) DO UPDATE
+         SET emotion_tag=excluded.emotion_tag, responded_at=CURRENT_TIMESTAMP`
+      ).bind(uid, dateKey, tag).run();
+    }
+
+    const closings = {
+      accomplished: "今天有做到一些對自己重要的事，這份進度值得看見✨",
+      calm: "有一點平靜就很好，今晚先把今天放下吧🌿",
+      anxious: "今天有點焦慮也沒關係，明天的事情明天再一起整理🐽",
+      exhausted: "今天真的累了，今晚先休息，不用再補進度🪫",
+      irritable: "今天有點煩躁，先讓這一天結束就好🐽",
+      down: "今天比較低落，明天我會盡量把事情排得更輕一點🌧️",
+      skip: "好，今天就到這裡🐽 晚安。"
+    };
+
+    return closings[tag] || "記下來了🐽 今天先到這裡。";
+  }
+
   const stuck = s.match(/^系統：卡住任務:(\d+)$/u);
   if (stuck) {
     const id = Number(stuck[1]);
