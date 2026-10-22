@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     CHANNEL_SECRET: str | None = None
     CHANNEL_ACCESS_TOKEN: str | None = None
     GEMINI_API_KEY: str = Field(...)
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-3.8-flash"
     DATABASE_URL: str = Field(...)
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
