@@ -24,6 +24,10 @@ export default {
     }
 
     return new Response("Not Found", { status: 404 });
+  },
+
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(processDueReminders(env, controller.scheduledTime));
   }
 };
 
@@ -505,6 +509,7 @@ async function ensureSchema(db) {
       remind_at TEXT,
       estimated_minutes INTEGER,
       status TEXT NOT NULL DEFAULT 'pending',
+      reminder_sent_at TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )`,
@@ -582,6 +587,77 @@ async function listTasksText(db, uid) {
   return "🟡 待處理：\n" + rows.map(t =>
     `#${t.id} ${t.title}｜${t.status}${t.due_time ? `｜截止 ${fmtTaipei(t.due_time)}` : ""}`
   ).join("\n");
+}
+
+async function ensureReminderColumn(db) {
+  try {
+    await db.prepare("ALTER TABLE tasks ADD COLUMN reminder_sent_at TEXT").run();
+  } catch (err) {
+    const msg = String(err?.message || err);
+    if (!/duplicate column name/i.test(msg)) throw err;
+  }
+}
+
+async function processDueReminders(env, scheduledTime) {
+  if (!env.DB || !env.CHANNEL_ACCESS_TOKEN) return;
+
+  await ensureSchema(env.DB);
+  await ensureReminderColumn(env.DB);
+
+  const now = new Date(scheduledTime || Date.now()).toISOString();
+  const due = await env.DB.prepare(
+    `SELECT id,line_user_id,title,due_time,remind_at
+     FROM tasks
+     WHERE status='pending'
+       AND remind_at IS NOT NULL
+       AND remind_at <= ?
+       AND reminder_sent_at IS NULL
+     ORDER BY remind_at ASC
+     LIMIT 50`
+  ).bind(now).all();
+
+  for (const task of (due.results || [])) {
+    const text = [
+      "⏰ 提醒時間到囉",
+      `📌 ${task.title}`,
+      task.due_time ? `截止：${fmtTaipei(task.due_time)}` : null,
+      "",
+      "完成後可以直接回我「完成 #"+task.id+"」。"
+    ].filter(x => x !== null).join("\n");
+
+    try {
+      await pushLine(task.line_user_id, text, env.CHANNEL_ACCESS_TOKEN);
+      await env.DB.prepare(
+        "UPDATE tasks SET reminder_sent_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?"
+      ).bind(task.id).run();
+      console.log("Reminder pushed", { task_id: task.id });
+    } catch (err) {
+      console.error("Reminder push failed", {
+        task_id: task.id,
+        name: err?.name || null,
+        message: err?.message || String(err)
+      });
+    }
+  }
+}
+
+async function pushLine(to, text, accessToken) {
+  const res = await fetch("https://api.line.me/v2/bot/message/push", {
+    method: "POST",
+    headers: {
+      ...JSON_HEADERS,
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      to,
+      messages: [{ type: "text", text: String(text || "").slice(0, 5000) }]
+    })
+  });
+
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`LINE push ${res.status}: ${detail.slice(0, 300)}`);
+  }
 }
 
 async function replyLine(replyToken, text, accessToken) {
