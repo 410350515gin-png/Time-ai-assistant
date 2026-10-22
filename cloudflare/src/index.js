@@ -1214,13 +1214,77 @@ async function activeTasksContext(db, uid) {
 
 async function listTasksText(db, uid) {
   const r = await db.prepare(
-    "SELECT id,title,status,due_time FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') ORDER BY COALESCE(due_time,'9999-12-31'), priority ASC LIMIT 50"
+    "SELECT id,title,status,due_time,remind_at FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') ORDER BY COALESCE(due_time,remind_at,'9999-12-31'), priority ASC LIMIT 50"
   ).bind(uid).all();
+
   const rows = r.results || [];
-  if (!rows.length) return "目前沒有待處理任務。";
-  return "🟡 待處理：\n" + rows.map(t =>
-    `#${t.id} ${t.title}｜${t.status}${t.due_time ? `｜截止 ${fmtTaipei(t.due_time)}` : ""}`
-  ).join("\n");
+  if (!rows.length) return "現在沒有待辦啦🐽✨";
+
+  const now = Date.now();
+  const todayKey = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Taipei",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date());
+
+  const buckets = { overdue: [], today: [], later: [], anytime: [] };
+
+  for (const t of rows) {
+    const rawTime = t.due_time || t.remind_at || null;
+    const when = rawTime ? new Date(rawTime) : null;
+    const item = {
+      id: t.id,
+      title: String(t.title || "").trim(),
+      time: when && !Number.isNaN(when.getTime()) ? when : null
+    };
+
+    if (!item.time) {
+      buckets.anytime.push(item);
+      continue;
+    }
+
+    const itemKey = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Taipei",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).format(item.time);
+
+    if (item.time.getTime() < now) buckets.overdue.push(item);
+    else if (itemKey === todayKey) buckets.today.push(item);
+    else buckets.later.push(item);
+  }
+
+  const formatItem = (item, showDate) => {
+    const timeText = item.time
+      ? new Intl.DateTimeFormat("zh-TW", {
+          timeZone: "Asia/Taipei",
+          ...(showDate ? { month: "2-digit", day: "2-digit" } : {}),
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false
+        }).format(item.time)
+      : null;
+
+    return `• ${item.title}${timeText ? `　${timeText}` : ""}`;
+  };
+
+  const sections = [];
+  if (buckets.overdue.length) {
+    sections.push("🥺 過期了\n" + buckets.overdue.map(x => formatItem(x, true)).join("\n"));
+  }
+  if (buckets.today.length) {
+    sections.push("🌤 今天\n" + buckets.today.map(x => formatItem(x, false)).join("\n"));
+  }
+  if (buckets.later.length) {
+    sections.push("📅 接下來\n" + buckets.later.map(x => formatItem(x, true)).join("\n"));
+  }
+  if (buckets.anytime.length) {
+    sections.push("🐽 還沒排時間\n" + buckets.anytime.map(x => formatItem(x, false)).join("\n"));
+  }
+
+  return "這些還在等你喔🐽\n\n" + sections.join("\n\n");
 }
 
 async function ensureReminderColumn(db) {
