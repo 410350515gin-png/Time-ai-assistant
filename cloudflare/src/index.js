@@ -273,7 +273,13 @@ async function handleTaskMessage(uid, text, env) {
     return "可以呀✏️ 直接用你平常說話的方式告訴我想怎麼改。";
   }
 
-  const context = await activeTasksContext(env.DB, uid);
+  const activeContext = await activeTasksContext(env.DB, uid);
+  const pendingContext = pending?.plan_items?.length
+    ? "\n\n尚未確認的方案：\n" + pending.plan_items.map((x, i) =>
+        `proposal_${i + 1};title=${x.title || ""};start=${x.start_time || ""};due=${x.due_time || ""};remind=${x.remind_at || ""};first_step=${x.first_step || ""}`
+      ).join("\n")
+    : "";
+  const context = activeContext + pendingContext;
   const result = await interpretStructured(text, context, env);
 
   if (result.intent === "list_tasks") {
@@ -320,8 +326,16 @@ async function handleTaskMessage(uid, text, env) {
   if (result.intent === "propose_plan" || result.intent === "revise_plan" || result.intent === "create_reminder") {
     let items = sanitizePlanItems(result.plan_items);
 
+    if (result.intent === "create_reminder" && items.length) {
+      items = items.map(item => applyAiTimeSemantics(item, result.time_semantics));
+    }
+
     // Safety validation only: AI understands language; program validates execution data.
     items = items.map(validatePlanTimes).filter(Boolean);
+
+    if (result.intent === "create_reminder" && !items.some(x => x.remind_at)) {
+      return result.reply || "我理解你要設定提醒，但目前還不能可靠確定提醒時間；請再補一點時間資訊。";
+    }
 
     if (items.length) {
       await setPendingPlan(env.DB, uid, { plan_items: items });
@@ -336,6 +350,35 @@ async function handleTaskMessage(uid, text, env) {
 function normalizeTaskIds(taskIds, taskId) {
   const raw = Array.isArray(taskIds) ? taskIds : (taskId !== null && taskId !== undefined ? [taskId] : []);
   return [...new Set(raw.map(Number).filter(Number.isInteger))].slice(0, 50);
+}
+
+function applyAiTimeSemantics(item, semantics) {
+  if (!item || !semantics || typeof semantics !== "object") return item;
+
+  if (semantics.kind === "relative") {
+    const amount = Number(semantics.amount);
+    const unit = semantics.unit;
+    if (!Number.isFinite(amount) || amount <= 0) return item;
+
+    const unitMs = {
+      minute: 60 * 1000,
+      hour: 60 * 60 * 1000,
+      day: 24 * 60 * 60 * 1000,
+      week: 7 * 24 * 60 * 60 * 1000
+    }[unit];
+
+    if (!unitMs) return item;
+    const when = new Date(Date.now() + amount * unitMs).toISOString();
+    return {
+      ...item,
+      start_time: when,
+      due_time: when,
+      remind_at: when,
+      reason: "AI 負責理解相對時間語意；實際時間由程式精確計算。"
+    };
+  }
+
+  return item;
 }
 
 function validatePlanTimes(item) {
@@ -771,6 +814,9 @@ ${context || "目前沒有"}
 13. 使用者是在要求提醒時，intent 使用 create_reminder，並在 plan_items 中輸出真正的任務名稱與 remind_at。
 14. 時間解析一律以 Asia/Taipei 為準。相對時間（例如「兩分鐘後」「半小時後」「三天後」）必須以現在台灣時間精確相加。
 15. 若使用者只是說「完成」「好了」「做完了」，優先參考現有任務與最近上下文判斷；若無法唯一判定，不要猜 task id。
+16. 若提醒時間是相對時間，例如「兩分鐘後」「半小時後」「1.5 小時後」「三天後」，你負責理解並填 time_semantics；不要自己做最終時間算術。kind=relative，amount 填數值（半小時 = 30 minute），unit 只能是 minute|hour|day|week。
+17. 若是絕對時間，例如「明早八點」「下週五下午三點」，kind=absolute，remind_at 仍輸出含 +08:00 的 ISO8601。
+18. 修改尚未確認的方案時，intent=revise_plan，必須依「尚未確認的方案」輸出完整修正版 plan_items，而不是新增另一份無關任務。
 
 JSON schema：
 {
@@ -778,6 +824,11 @@ JSON schema：
   "reply": "給使用者看的繁體中文文字",
   "task_id": 3,
   "task_ids": [3, 7],
+  "time_semantics": {
+    "kind": "relative|absolute|none",
+    "amount": 2,
+    "unit": "minute|hour|day|week"
+  },
   "plan_items": [
     {
       "title": "任務名稱",
@@ -836,6 +887,21 @@ ${message}`;
     parsed.task_id = Number.isInteger(n) ? n : null;
   } else {
     parsed.task_id = null;
+  }
+
+  if (!parsed.time_semantics || typeof parsed.time_semantics !== "object") {
+    parsed.time_semantics = { kind: "none", amount: null, unit: null };
+  }
+  const allowedTimeKinds = new Set(["relative","absolute","none"]);
+  if (!allowedTimeKinds.has(parsed.time_semantics.kind)) parsed.time_semantics.kind = "none";
+  if (parsed.time_semantics.kind === "relative") {
+    parsed.time_semantics.amount = Number(parsed.time_semantics.amount);
+    if (!Number.isFinite(parsed.time_semantics.amount) || parsed.time_semantics.amount <= 0) {
+      parsed.time_semantics.kind = "none";
+    }
+    if (!["minute","hour","day","week"].includes(parsed.time_semantics.unit)) {
+      parsed.time_semantics.kind = "none";
+    }
   }
   return parsed;
 }
