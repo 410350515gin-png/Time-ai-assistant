@@ -141,6 +141,7 @@ async function processQueuedLineEvent(event, env) {
   if (env.DB) {
     await ensureSchema(env.DB);
     await ensureReminderColumn(env.DB);
+    await ensureRecurrenceColumn(env.DB);
   }
 
   console.log("Queue LINE text event", {
@@ -817,8 +818,27 @@ function sanitizePlanItems(items) {
       estimated_minutes: x.estimated_minutes !== null && x.estimated_minutes !== undefined && x.estimated_minutes !== "" && Number.isFinite(Number(x.estimated_minutes))
         ? Math.max(1, Math.round(Number(x.estimated_minutes)))
         : null,
+      recurrence: sanitizeRecurrence(x.recurrence),
       reason: x.reason ? String(x.reason).slice(0, 500) : ""
     }));
+}
+
+function sanitizeRecurrence(v) {
+  if (!v || typeof v !== "object") return null;
+  const freq = String(v.freq || "").toLowerCase();
+  if (!["daily","weekly","monthly"].includes(freq)) return null;
+
+  const interval = Math.max(1, Math.min(365, Number(v.interval) || 1));
+  const weekdays = Array.isArray(v.weekdays)
+    ? [...new Set(v.weekdays.map(Number).filter(n => Number.isInteger(n) && n >= 0 && n <= 6))]
+    : [];
+  const dayOfMonth = Number.isInteger(Number(v.day_of_month))
+    ? Math.max(1, Math.min(31, Number(v.day_of_month)))
+    : null;
+  const time = /^\d{2}:\d{2}$/.test(String(v.time || "")) ? String(v.time) : null;
+  const until = normalizeIso(v.until);
+
+  return { freq, interval, weekdays, day_of_month: dayOfMonth, time, until };
 }
 
 function normalizeIso(v) {
@@ -834,10 +854,23 @@ function formatPlan(items) {
       x.start_time ? `開始 ${fmtTaipei(x.start_time)}` : null,
       x.due_time ? `截止 ${fmtTaipei(x.due_time)}` : null,
       x.remind_at ? `提醒 ${fmtTaipei(x.remind_at)}` : null,
+      x.recurrence ? `重複 ${formatRecurrence(x.recurrence)}` : null,
       x.estimated_minutes ? `${x.estimated_minutes} 分鐘` : null
     ].filter(Boolean);
     return bits.join("｜") + (x.reason ? `\n   原因：${x.reason}` : "");
   }).join("\n");
+}
+
+function formatRecurrence(r) {
+  if (!r) return "";
+  const dayNames = ["日","一","二","三","四","五","六"];
+  if (r.freq === "daily") return `每${r.interval > 1 ? r.interval : ""}天${r.time ? " " + r.time : ""}`;
+  if (r.freq === "weekly") {
+    const days = (r.weekdays || []).map(d => "週" + dayNames[d]).join("、");
+    return `每${r.interval > 1 ? r.interval : ""}週${days ? " " + days : ""}${r.time ? " " + r.time : ""}`;
+  }
+  if (r.freq === "monthly") return `每${r.interval > 1 ? r.interval : ""}月${r.day_of_month ? " " + r.day_of_month + "號" : ""}${r.time ? " " + r.time : ""}`;
+  return "";
 }
 
 function fmtTaipei(v) {
@@ -912,6 +945,9 @@ ${context || "目前沒有"}
 16. 若提醒時間是相對時間，例如「兩分鐘後」「半小時後」「1.5 小時後」「三天後」，你負責理解並填 time_semantics；不要自己做最終時間算術。kind=relative，amount 填數值（半小時 = 30 minute），unit 只能是 minute|hour|day|week。
 17. 若是絕對時間，例如「明早八點」「下週五下午三點」，kind=absolute，remind_at 仍輸出含 +08:00 的 ISO8601。
 18. 修改尚未確認的方案時，intent=revise_plan，必須依「尚未確認的方案」輸出完整修正版 plan_items，而不是新增另一份無關任務。
+19. 使用者描述固定課表、每週、每天、每月、固定週期時，可以在 plan_items.recurrence 填週期設定；不要把未來每一次全部展開成很多筆任務。
+20. 使用者一次給多項行程時，你仍要先幫他比較衝突、優先順序、空檔與負荷，必要時提出較合理的時間安排；除非使用者明確要求立即建立，否則先提出完整方案讓他確認。
+21. recurrence 格式：freq 只能 daily|weekly|monthly；weekdays 用 0=週日...6=週六；time 用 HH:MM；monthly 可用 day_of_month。
 
 JSON schema：
 {
@@ -934,6 +970,14 @@ JSON schema：
       "due_time": "ISO8601 或 null",
       "remind_at": "ISO8601 或 null",
       "estimated_minutes": 60,
+      "recurrence": {
+        "freq": "weekly",
+        "interval": 1,
+        "weekdays": [1,3,5],
+        "day_of_month": null,
+        "time": "09:00",
+        "until": null
+      },
       "reason": "排序理由"
     }
   ]
@@ -1195,6 +1239,7 @@ async function ensureSchema(db) {
       due_time TEXT,
       remind_at TEXT,
       estimated_minutes INTEGER,
+      recurrence_json TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       reminder_sent_at TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -1246,11 +1291,12 @@ async function savePlanTasks(db, uid, items) {
   if (!clean.length) return 0;
   const stmts = clean.map(x => db.prepare(
     `INSERT INTO tasks(
-      line_user_id,title,description,first_step,priority,start_time,due_time,remind_at,estimated_minutes,status
-    ) VALUES (?,?,?,?,?,?,?,?,?,'pending')`
+      line_user_id,title,description,first_step,priority,start_time,due_time,remind_at,estimated_minutes,recurrence_json,status
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,'pending')`
   ).bind(
     uid, x.title, x.description, x.first_step, x.priority,
-    x.start_time, x.due_time, x.remind_at, x.estimated_minutes
+    x.start_time, x.due_time, x.remind_at, x.estimated_minutes,
+    x.recurrence ? JSON.stringify(x.recurrence) : null
   ));
   const results = await db.batch(stmts);
   return results.reduce((n, r) => n + Number(r?.meta?.changes || 0), 0);
@@ -1374,6 +1420,15 @@ async function ensureReminderColumn(db) {
   }
 }
 
+async function ensureRecurrenceColumn(db) {
+  try {
+    await db.prepare("ALTER TABLE tasks ADD COLUMN recurrence_json TEXT").run();
+  } catch (err) {
+    const msg = String(err?.message || err);
+    if (!/duplicate column name/i.test(msg)) throw err;
+  }
+}
+
 async function processDueReminders(env, scheduledTime) {
   if (!env.DB || !env.CHANNEL_ACCESS_TOKEN) return;
 
@@ -1382,7 +1437,7 @@ async function processDueReminders(env, scheduledTime) {
 
   const now = new Date(scheduledTime || Date.now()).toISOString();
   const due = await env.DB.prepare(
-    `SELECT id,line_user_id,title,due_time,remind_at
+    `SELECT id,line_user_id,title,due_time,remind_at,recurrence_json
      FROM tasks
      WHERE status='pending'
        AND remind_at IS NOT NULL
@@ -1416,9 +1471,18 @@ async function processDueReminders(env, scheduledTime) {
 
     try {
       await pushLine(task.line_user_id, text, env.CHANNEL_ACCESS_TOKEN);
-      await env.DB.prepare(
-        "UPDATE tasks SET reminder_sent_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?"
-      ).bind(task.id).run();
+      const recurrence = parseRecurrenceJson(task.recurrence_json);
+      const next = recurrence ? computeNextOccurrence(task.remind_at, recurrence) : null;
+
+      if (next) {
+        await env.DB.prepare(
+          "UPDATE tasks SET remind_at=?, due_time=?, reminder_sent_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?"
+        ).bind(next, next, task.id).run();
+      } else {
+        await env.DB.prepare(
+          "UPDATE tasks SET reminder_sent_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?"
+        ).bind(task.id).run();
+      }
       console.log("Reminder pushed", { task_id: task.id });
     } catch (err) {
       console.error("Reminder push failed", {
@@ -1428,6 +1492,52 @@ async function processDueReminders(env, scheduledTime) {
       });
     }
   }
+}
+
+function parseRecurrenceJson(v) {
+  if (!v) return null;
+  try { return sanitizeRecurrence(JSON.parse(v)); } catch { return null; }
+}
+
+function computeNextOccurrence(currentIso, r) {
+  const current = new Date(currentIso);
+  if (Number.isNaN(current.getTime()) || !r) return null;
+
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Taipei",
+    year: "numeric", month: "2-digit", day: "2-digit"
+  }).formatToParts(current);
+  const get = t => Number(parts.find(p => p.type === t)?.value);
+  const [hh, mm] = String(r.time || "09:00").split(":").map(Number);
+  let base = new Date(`${get("year")}-${String(get("month")).padStart(2,"0")}-${String(get("day")).padStart(2,"0")}T${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}:00+08:00`);
+
+  let next = null;
+  if (r.freq === "daily") {
+    next = new Date(base.getTime() + r.interval * 86400000);
+  } else if (r.freq === "weekly") {
+    const days = (r.weekdays || []).length ? r.weekdays : [base.getUTCDay()];
+    for (let offset = 1; offset <= 7 * r.interval + 7; offset++) {
+      const cand = new Date(base.getTime() + offset * 86400000);
+      const taipeiDow = Number(new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Taipei", weekday: "short" })
+        .formatToParts(cand).find(p => p.type === "weekday") ? cand.toLocaleString("en-US",{timeZone:"Asia/Taipei",weekday:"short"}) : "");
+      const jsDow = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].indexOf(cand.toLocaleString("en-US",{timeZone:"Asia/Taipei",weekday:"short"}));
+      if (days.includes(jsDow)) { next = cand; break; }
+    }
+  } else if (r.freq === "monthly") {
+    const target = new Date(base.getTime());
+    target.setUTCMonth(target.getUTCMonth() + r.interval);
+    if (r.day_of_month) {
+      const y = Number(new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Taipei",year:"numeric"}).format(target));
+      const m = Number(new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Taipei",month:"2-digit"}).format(target));
+      const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+      const d = Math.min(r.day_of_month, last);
+      next = new Date(`${y}-${String(m).padStart(2,"0")}-${String(d).padStart(2,"0")}T${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}:00+08:00`);
+    } else next = target;
+  }
+
+  if (!next || Number.isNaN(next.getTime())) return null;
+  if (r.until && next.getTime() > new Date(r.until).getTime()) return null;
+  return next.toISOString();
 }
 
 function buildCompletionMessage(task, env) {
