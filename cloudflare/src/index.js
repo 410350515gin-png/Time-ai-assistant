@@ -217,10 +217,26 @@ function fmtTaipei(v) {
 }
 
 async function interpretStructured(message, context, env) {
+  const now = new Date();
+  const taipeiNow = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Taipei",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(now);
+  const weekday = new Intl.DateTimeFormat("zh-TW", {
+    timeZone: "Asia/Taipei",
+    weekday: "long"
+  }).format(now);
+
   const prompt = `你是繁體中文的 AI 行動管家。
 你的工作是把自然語言待辦整理成可以執行的計畫。
 
-現在時間：${new Date().toISOString()}
+現在台灣時間：${taipeiNow}（${weekday}）
 時區：Asia/Taipei
 
 現有待辦：
@@ -232,6 +248,10 @@ ${context || "目前沒有"}
 3. 不要假裝資料已經儲存；你只能提出方案。
 4. 若資訊不足，不要亂編固定行程；可以用合理建議，但要保守。
 5. 僅輸出 JSON，不要 markdown。
+6. 所有「今天、明天、後天、週幾、本週、下週、月底」都必須以「現在台灣時間」換算成正確的台灣日期，不能用 UTC 日期直接推算。
+7. 「下午」預設代表 13:00–17:59；若使用者只說下午，不要排到晚上。
+8. 「週五前」代表最晚必須在本週五當天完成，不可排到週六或週日；若今天已經是週五，則視情況安排今天完成。
+9. 若使用者明確給截止日，due_time 不得晚於該截止日。
 
 JSON schema：
 {
