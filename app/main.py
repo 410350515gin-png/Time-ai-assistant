@@ -9,9 +9,25 @@ from app.models import Task,TaskStatus,UserMemory
 from app.services.line_service import line_parser,reply_message
 from app.services.task_service import *
 from app.agent.gemini_coach import interpret_message
+from app.services.reminder_service import dispatch_due_reminders, send_daily_summaries
+from apscheduler.schedulers.background import BackgroundScheduler
 logging.basicConfig(level=settings.LOG_LEVEL);logger=logging.getLogger(__name__)
-app=FastAPI(title="LINE Action Agent",version="2.0")
+app=FastAPI(title="LINE Action Agent",version="2.1")
 Base.metadata.create_all(bind=engine)
+scheduler=BackgroundScheduler(timezone=settings.tz)
+def _run_reminders():
+    with SessionLocal() as db:
+        dispatch_due_reminders(db)
+@app.on_event("startup")
+def start_scheduler():
+    if not scheduler.running:
+        scheduler.add_job(_run_reminders,"interval",seconds=30,id="reminders",replace_existing=True,max_instances=1,coalesce=True)
+        scheduler.add_job(send_daily_summaries,"interval",seconds=30,id="summaries",replace_existing=True,max_instances=1,coalesce=True)
+        scheduler.start()
+@app.on_event("shutdown")
+def stop_scheduler():
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
 YES={"是","好","確認","確認執行","同意","可以","ok","yes","好啊","照這個安排","確認計畫"}
 NO={"否","不要","取消","不用","no","先不要","不接受"}
 def fmt(v):
@@ -24,7 +40,7 @@ def context(tasks):
     return "\n".join(f"id={t.id};title={t.title};status={t.status.value};start={t.start_time};due={t.due_time};first_step={t.first_step}" for t in tasks[:40])
 @app.get("/")
 @app.get("/health")
-def health():return {"status":"ok","version":"2.0"}
+def health():return {"status":"ok","version":"2.1"}
 @app.post("/callback")
 @app.post("/webhook")
 async def webhook(request:Request):
