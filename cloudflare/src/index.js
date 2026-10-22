@@ -111,6 +111,17 @@ async function handleLineWebhook(request, env, ctx) {
   const events = Array.isArray(body.events) ? body.events : [];
   console.log("LINE events count", events.length);
 
+  if (env.DB && env.CHANNEL_ACCESS_TOKEN) {
+    ctx.waitUntil(
+      ensurePigRichMenu(env).catch(err => {
+        console.error("Rich Menu bootstrap failed", {
+          name: err?.name || null,
+          message: err?.message || String(err)
+        });
+      })
+    );
+  }
+
   if (!env.GEMINI_QUEUE) {
     console.error("GEMINI_QUEUE binding missing");
     return json({ error: "queue unavailable" }, 503);
@@ -1523,6 +1534,11 @@ async function ensureSchema(db) {
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )`,
+    `CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`,
     `CREATE TABLE IF NOT EXISTS pending_plans (
       line_user_id TEXT PRIMARY KEY,
       plan_json TEXT NOT NULL,
@@ -2005,6 +2021,227 @@ async function replyLine(replyToken, text, accessToken) {
     const detail = await res.text();
     throw new Error(`LINE reply ${res.status}: ${detail.slice(0, 300)}`);
   }
+}
+
+let richMenuReadyInIsolate = false;
+
+async function ensurePigRichMenu(env) {
+  if (richMenuReadyInIsolate) return;
+
+  await ensureSchema(env.DB);
+  const saved = await env.DB.prepare(
+    "SELECT value FROM app_settings WHERE key='default_rich_menu_id'"
+  ).first();
+
+  if (saved?.value) {
+    richMenuReadyInIsolate = true;
+    return;
+  }
+
+  const auth = { authorization: `Bearer ${env.CHANNEL_ACCESS_TOKEN}` };
+
+  // Reuse an existing menu with the same name if a prior setup partially succeeded.
+  const listRes = await fetch("https://api.line.me/v2/bot/richmenu/list", {
+    headers: auth
+  });
+  if (!listRes.ok) {
+    const detail = await listRes.text();
+    throw new Error(`LINE rich menu list ${listRes.status}: ${detail.slice(0, 200)}`);
+  }
+
+  const list = await listRes.json();
+  let richMenuId = (list.richmenus || []).find(x => x.name === "Pig Secretary Task Book")?.richMenuId || null;
+
+  if (!richMenuId) {
+    const createRes = await fetch("https://api.line.me/v2/bot/richmenu", {
+      method: "POST",
+      headers: { ...auth, ...JSON_HEADERS },
+      body: JSON.stringify({
+        size: { width: 2500, height: 843 },
+        selected: true,
+        name: "Pig Secretary Task Book",
+        chatBarText: "🐽 任務本",
+        areas: [{
+          bounds: { x: 0, y: 0, width: 2500, height: 843 },
+          action: {
+            type: "message",
+            label: "查看所有任務",
+            text: "系統：任務首頁"
+          }
+        }]
+      })
+    });
+
+    if (!createRes.ok) {
+      const detail = await createRes.text();
+      throw new Error(`LINE rich menu create ${createRes.status}: ${detail.slice(0, 300)}`);
+    }
+
+    const created = await createRes.json();
+    richMenuId = created.richMenuId;
+
+    const png = await buildPigRichMenuPng();
+    const uploadRes = await fetch(
+      `https://api-data.line.me/v2/bot/richmenu/${encodeURIComponent(richMenuId)}/content`,
+      {
+        method: "POST",
+        headers: {
+          ...auth,
+          "content-type": "image/png"
+        },
+        body: png
+      }
+    );
+
+    if (!uploadRes.ok) {
+      const detail = await uploadRes.text();
+      throw new Error(`LINE rich menu image upload ${uploadRes.status}: ${detail.slice(0, 300)}`);
+    }
+  }
+
+  const defaultRes = await fetch(
+    `https://api.line.me/v2/bot/user/all/richmenu/${encodeURIComponent(richMenuId)}`,
+    { method: "POST", headers: auth }
+  );
+
+  if (!defaultRes.ok) {
+    const detail = await defaultRes.text();
+    throw new Error(`LINE default rich menu ${defaultRes.status}: ${detail.slice(0, 300)}`);
+  }
+
+  await env.DB.prepare(
+    "INSERT INTO app_settings(key,value,updated_at) VALUES('default_rich_menu_id',?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP"
+  ).bind(richMenuId).run();
+
+  richMenuReadyInIsolate = true;
+  console.log("Pig task Rich Menu ready", { richMenuId });
+}
+
+async function buildPigRichMenuPng() {
+  const width = 2500;
+  const height = 843;
+  const stride = 1 + width * 3;
+  const raw = new Uint8Array(stride * height);
+
+  // Soft pink background.
+  for (let y = 0; y < height; y++) {
+    const row = y * stride;
+    raw[row] = 0;
+    for (let x = 0; x < width; x++) {
+      const p = row + 1 + x * 3;
+      raw[p] = 255;
+      raw[p + 1] = 241;
+      raw[p + 2] = 244;
+    }
+  }
+
+  const setPixel = (x, y, r, g, b) => {
+    if (x < 0 || x >= width || y < 0 || y >= height) return;
+    const p = y * stride + 1 + x * 3;
+    raw[p] = r; raw[p + 1] = g; raw[p + 2] = b;
+  };
+
+  const circle = (cx, cy, radius, color) => {
+    const [r,g,b] = color;
+    const r2 = radius * radius;
+    for (let y = Math.max(0, cy-radius); y <= Math.min(height-1, cy+radius); y++) {
+      const dy = y - cy;
+      const dx = Math.floor(Math.sqrt(Math.max(0, r2 - dy*dy)));
+      for (let x = cx-dx; x <= cx+dx; x++) setPixel(x,y,r,g,b);
+    }
+  };
+
+  // Pig face.
+  circle(500, 420, 235, [255,186,200]);
+  circle(405, 365, 24, [65,50,55]);
+  circle(595, 365, 24, [65,50,55]);
+  circle(500, 500, 115, [255,218,225]);
+  circle(455, 500, 18, [90,65,72]);
+  circle(545, 500, 18, [90,65,72]);
+
+  // Cute ear triangles.
+  for (let yy = 165; yy < 310; yy++) {
+    const span = Math.floor((yy - 165) * 0.9);
+    for (let xx = 275 - span/2; xx <= 275 + span/2; xx++) setPixel(Math.floor(xx),yy,255,186,200);
+    for (let xx = 725 - span/2; xx <= 725 + span/2; xx++) setPixel(Math.floor(xx),yy,255,186,200);
+  }
+
+  // Simple bitmap word TASKS; whole banner is one tappable button.
+  const glyphs = {
+    T:["11111","00100","00100","00100","00100","00100","00100"],
+    A:["01110","10001","10001","11111","10001","10001","10001"],
+    S:["01111","10000","10000","01110","00001","00001","11110"],
+    K:["10001","10010","10100","11000","10100","10010","10001"]
+  };
+  const word = "TASKS";
+  const scale = 34;
+  const gap = 44;
+  let x0 = 1050;
+  const y0 = 265;
+
+  for (const ch of word) {
+    const rows = glyphs[ch];
+    for (let gy=0; gy<7; gy++) {
+      for (let gx=0; gx<5; gx++) {
+        if (rows[gy][gx] !== "1") continue;
+        for (let py=0; py<scale; py++) {
+          for (let px=0; px<scale; px++) {
+            setPixel(x0 + gx*scale + px, y0 + gy*scale + py, 65,50,55);
+          }
+        }
+      }
+    }
+    x0 += 5*scale + gap;
+  }
+
+  const compressed = new Uint8Array(await new Response(
+    new Blob([raw]).stream().pipeThrough(new CompressionStream("deflate"))
+  ).arrayBuffer());
+
+  const crcTable = (() => {
+    const table = new Uint32Array(256);
+    for (let n=0; n<256; n++) {
+      let cc=n;
+      for (let k=0; k<8; k++) cc = (cc & 1) ? (0xedb88320 ^ (cc >>> 1)) : (cc >>> 1);
+      table[n]=cc>>>0;
+    }
+    return table;
+  })();
+
+  const crc32 = bytes => {
+    let crc = 0xffffffff;
+    for (const b of bytes) crc = crcTable[(crc ^ b) & 0xff] ^ (crc >>> 8);
+    return (crc ^ 0xffffffff) >>> 0;
+  };
+
+  const u32 = n => new Uint8Array([(n>>>24)&255,(n>>>16)&255,(n>>>8)&255,n&255]);
+  const chunk = (type, data) => {
+    const typeBytes = new TextEncoder().encode(type);
+    const crcInput = new Uint8Array(typeBytes.length + data.length);
+    crcInput.set(typeBytes,0); crcInput.set(data,typeBytes.length);
+    const out = new Uint8Array(12 + data.length);
+    out.set(u32(data.length),0);
+    out.set(typeBytes,4);
+    out.set(data,8);
+    out.set(u32(crc32(crcInput)),8+data.length);
+    return out;
+  };
+
+  const ihdr = new Uint8Array(13);
+  ihdr.set(u32(width),0);
+  ihdr.set(u32(height),4);
+  ihdr[8]=8;   // bit depth
+  ihdr[9]=2;   // RGB
+  ihdr[10]=0; ihdr[11]=0; ihdr[12]=0;
+
+  const signature = new Uint8Array([137,80,78,71,13,10,26,10]);
+  const chunks = [chunk("IHDR",ihdr), chunk("IDAT",compressed), chunk("IEND",new Uint8Array())];
+  const size = signature.length + chunks.reduce((n,x)=>n+x.length,0);
+  const png = new Uint8Array(size);
+  let offset=0;
+  png.set(signature,offset); offset+=signature.length;
+  for (const part of chunks) { png.set(part,offset); offset+=part.length; }
+  return png;
 }
 
 async function verifyLineSignature(body, signature, secret) {
