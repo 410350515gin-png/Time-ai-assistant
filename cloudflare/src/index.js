@@ -250,20 +250,81 @@ JSON schema：
 使用者：
 ${message}`;
 
-  const raw = await callGemini(prompt, env, true);
+  let raw;
+  try {
+    raw = await callGemini(prompt, env, true);
+  } catch (jsonErr) {
+    console.error("Structured Gemini JSON mode failed, retrying plain mode", String(jsonErr));
+    try {
+      raw = await callGemini(prompt, env, false);
+    } catch (plainErr) {
+      console.error("Structured Gemini plain mode also failed", String(plainErr));
+      return buildLocalFallback(message);
+    }
+  }
+
   let parsed;
   try {
     parsed = JSON.parse(stripFence(raw));
   } catch {
     const m = raw.match(/\{[\s\S]*\}/);
-    if (!m) throw new Error("Gemini did not return JSON");
-    parsed = JSON.parse(m[0]);
+    if (!m) {
+      console.error("Gemini returned non-JSON content; using local fallback");
+      return buildLocalFallback(message);
+    }
+    try {
+      parsed = JSON.parse(m[0]);
+    } catch {
+      console.error("Gemini JSON parse failed; using local fallback");
+      return buildLocalFallback(message);
+    }
   }
 
   const allowed = new Set(["chat","propose_plan","revise_plan","list_tasks","complete_task"]);
   if (!allowed.has(parsed.intent)) parsed.intent = "chat";
   if (typeof parsed.reply !== "string") parsed.reply = "";
   return parsed;
+}
+
+function buildLocalFallback(message) {
+  const normalized = String(message || "")
+    .replace(/^幫我安排[:：]?/u, "")
+    .replace(/^幫我整理[:：]?/u, "")
+    .trim();
+
+  const parts = normalized
+    .split(/[、，,；;\n]+/u)
+    .map(x => x.trim())
+    .filter(Boolean)
+    .slice(0, 10);
+
+  if (!parts.length) {
+    return {
+      intent: "chat",
+      reply: "我有收到訊息，但 AI 暫時不穩。你可以直接把待辦一項一項列給我，我會先用保底模式整理。",
+      task_id: null,
+      plan_items: []
+    };
+  }
+
+  const items = parts.map((p, i) => ({
+    title: p.slice(0, 120),
+    description: null,
+    first_step: "先確認需要完成的具體內容與所需資料",
+    priority: Math.min(5, i + 1),
+    start_time: null,
+    due_time: null,
+    remind_at: null,
+    estimated_minutes: null,
+    reason: "AI 暫時不可用，先依輸入順序建立保底方案；之後可再調整時間與優先順序。"
+  }));
+
+  return {
+    intent: "propose_plan",
+    reply: "Gemini 目前回應不穩，我先用保底模式把任務整理出來，避免整段失敗。",
+    task_id: null,
+    plan_items: items
+  };
 }
 
 async function interpretPlainText(message, env) {
