@@ -21,3 +21,16 @@ persist = true
 
 [triggers]
 crons = ["* * * * *"]
+
+
+[[queues.producers]]
+binding = "GEMINI_QUEUE"
+queue = "gemini-tasks"
+
+[[queues.consumers]]
+queue = "gemini-tasks"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 3
+retry_delay = 30
+dead_letter_queue = "gemini-tasks-dlq"
