@@ -259,6 +259,25 @@ async function handleTaskMessage(uid, text, env) {
   }
 
 
+  if (/^(完成|完成了|做完|做完了|好了|搞定)$/u.test(text)) {
+    const recent = await env.DB.prepare(
+      `SELECT id,title
+       FROM tasks
+       WHERE line_user_id=?
+         AND status='pending'
+         AND reminder_sent_at IS NOT NULL
+       ORDER BY reminder_sent_at DESC, id DESC
+       LIMIT 1`
+    ).bind(uid).first();
+
+    if (recent) {
+      const task = await env.DB.prepare(
+        "UPDATE tasks SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? AND status='pending' RETURNING id,title"
+      ).bind(recent.id, uid).first();
+      if (task) return buildCompletionMessage(task, env);
+    }
+  }
+
   const completeMatch = text.match(/(?:完成|做完|完成任務)\s*#?(\d+)/u);
   if (completeMatch) {
     const id = Number(completeMatch[1]);
