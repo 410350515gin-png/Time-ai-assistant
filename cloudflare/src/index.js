@@ -136,9 +136,13 @@ async function handleLineWebhook(request, env, ctx) {
 }
 
 async function processQueuedLineEvent(event, env) {
-  if (event?.type !== "message" || event?.message?.type !== "text") return;
+  const isText = event?.type === "message" && event?.message?.type === "text";
+  const isPostback = event?.type === "postback" && typeof event?.postback?.data === "string";
+  if (!isText && !isPostback) return;
 
-  const text = (event.message.text || "").trim();
+  const text = isPostback
+    ? String(event.postback.data || "").trim()
+    : String(event.message.text || "").trim();
   const uid = event?.source?.userId;
   if (!text || !uid) return;
 
@@ -402,7 +406,7 @@ async function handleFastPath(uid, text, env) {
     const pending = await getPendingPlan(env.DB, uid);
     const items = Array.isArray(pending?.plan_items) ? pending.plan_items : [];
     if (items.length !== 1) return "這次有多個任務，直接跟我說哪一項要改成哪一類就好🐽";
-    return categoryChoiceMessage("待確認任務", "pending");
+    return categoryChoiceMessage(items[0].title, "pending");
   }
 
   const pendingType = s.match(/^系統：設定待確認分類:(routine|goal|daily)$/u);
@@ -483,6 +487,12 @@ async function handleFastPath(uid, text, env) {
   return null;
 }
 
+function hiddenPostbackAction(label, data, displayText = null) {
+  const action = { type: "postback", label, data };
+  if (displayText) action.displayText = displayText;
+  return action;
+}
+
 function categoryChoiceMessage(title, target) {
   const pending = target === "pending";
   const prefix = pending ? "系統：設定待確認分類:" : `系統：設定分類:${target}:`;
@@ -490,9 +500,9 @@ function categoryChoiceMessage(title, target) {
     text: `「${title}」要放去哪一類？🐽`,
     quickReply: {
       items: [
-        { type: "action", action: { type: "message", label: "🔁 例行", text: prefix + "routine" } },
-        { type: "action", action: { type: "message", label: "🎯 目標", text: prefix + "goal" } },
-        { type: "action", action: { type: "message", label: "🧺 日常", text: prefix + "daily" } }
+        { type: "action", action: hiddenPostbackAction("🔁 例行", prefix + "routine", "改成例行任務 🔁") },
+        { type: "action", action: hiddenPostbackAction("🎯 目標", prefix + "goal", "改成目標任務 🎯") },
+        { type: "action", action: hiddenPostbackAction("🧺 日常", prefix + "daily", "改成日常任務 🧺") }
       ]
     }
   };
@@ -513,15 +523,15 @@ function buildTaskHubMessage() {
           {
             type: "button",
             style: "primary",
-            action: { type: "message", label: "🔁 例行性任務", text: "系統：任務分類:routine" }
+            action: hiddenPostbackAction("🔁 例行性任務", "系統：任務分類:routine", "查看例行性任務 🔁")
           },
           {
             type: "button",
-            action: { type: "message", label: "🎯 目標任務", text: "系統：任務分類:goal" }
+            action: hiddenPostbackAction("🎯 目標任務", "系統：任務分類:goal", "查看目標任務 🎯")
           },
           {
             type: "button",
-            action: { type: "message", label: "🧺 日常任務", text: "系統：任務分類:daily" }
+            action: hiddenPostbackAction("🧺 日常任務", "系統：任務分類:daily", "查看日常任務 🧺")
           }
         ]
       }
@@ -547,7 +557,7 @@ async function listTasksByType(db, uid, type) {
       quickReply: {
         items: [{
           type: "action",
-          action: { type: "message", label: "← 回任務中心", text: "查看所有任務" }
+          action: hiddenPostbackAction("← 回任務中心", "系統：列出任務", "查看所有任務")
         }]
       }
     };
@@ -581,17 +591,17 @@ async function listTasksByType(db, uid, type) {
             {
               type: "button",
               height: "sm",
-              action: { type: "message", label: "完成✅", text: `系統：完成任務:${t.id}` }
+              action: hiddenPostbackAction("完成✅", `系統：完成任務:${t.id}`, `完成「${String(t.title || "").slice(0, 40)}」✅`)
             },
             {
               type: "button",
               height: "sm",
-              action: { type: "message", label: "分類🏷️", text: `系統：改分類:${t.id}` }
+              action: hiddenPostbackAction("分類🏷️", `系統：改分類:${t.id}`, `修改「${String(t.title || "").slice(0, 40)}」分類 🏷️`)
             },
             {
               type: "button",
               height: "sm",
-              action: { type: "message", label: "刪除🗑️", text: `系統：刪除任務:${t.id}` }
+              action: hiddenPostbackAction("刪除🗑️", `系統：刪除任務:${t.id}`, `刪除「${String(t.title || "").slice(0, 40)}」🗑️`)
             }
           ]
         }
@@ -608,7 +618,7 @@ async function listTasksByType(db, uid, type) {
     quickReply: {
       items: [{
         type: "action",
-        action: { type: "message", label: "← 回任務中心", text: "查看所有任務" }
+        action: hiddenPostbackAction("← 回任務中心", "系統：列出任務", "查看所有任務")
       }]
     }
   };
@@ -1690,19 +1700,19 @@ async function listTasksText(db, uid, taskType = null) {
     const short = String(t.title || "").trim().slice(0, 8);
     quickItems.push({
       type: "action",
-      action: {
-        type: "message",
-        label: `✅ ${short}`.slice(0, 20),
-        text: `系統：完成任務:${t.id}`
-      }
+      action: hiddenPostbackAction(
+        `✅ ${short}`.slice(0, 20),
+        `系統：完成任務:${t.id}`,
+        `完成「${short}」✅`
+      )
     });
     quickItems.push({
       type: "action",
-      action: {
-        type: "message",
-        label: `🗑️ ${short}`.slice(0, 20),
-        text: `系統：刪除任務:${t.id}`
-      }
+      action: hiddenPostbackAction(
+        `🗑️ ${short}`.slice(0, 20),
+        `系統：刪除任務:${t.id}`,
+        `刪除「${short}」🗑️`
+      )
     });
   }
 
@@ -1770,11 +1780,7 @@ async function processDueReminders(env, scheduledTime) {
         items: [
           {
             type: "action",
-            action: {
-              type: "message",
-              label: "完成了✅",
-              text: `完成 #${task.id}`
-            }
+            action: hiddenPostbackAction("完成了✅", `系統：完成任務:${task.id}`, `完成「${String(task.title || "").slice(0, 40)}」✅`)
           }
         ]
       }
@@ -1892,7 +1898,7 @@ function withPlanActions(text, allowCategoryChange = false) {
   if (allowCategoryChange) {
     items.push({
       type: "action",
-      action: { type: "message", label: "🏷️ 改分類", text: "系統：改待確認分類" }
+      action: hiddenPostbackAction("🏷️ 改分類", "系統：改待確認分類", "修改分類 🏷️")
     });
   }
 
