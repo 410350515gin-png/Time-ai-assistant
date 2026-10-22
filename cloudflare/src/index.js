@@ -57,6 +57,14 @@ async function handleLineWebhook(request, env, ctx) {
 }
 
 async function processLineEvents(events, env) {
+  if (env.DB) {
+    try {
+      await ensureSchema(env.DB);
+    } catch (err) {
+      console.error("D1 schema init failed", err);
+    }
+  }
+
   for (const event of events) {
     if (event?.type !== "message" || event?.message?.type !== "text") continue;
 
@@ -339,6 +347,48 @@ function stripFence(text) {
     .trim();
 }
 
+async function ensureSchema(db) {
+  const statements = [
+    `CREATE TABLE IF NOT EXISTS webhook_events (
+      event_id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS users (
+      line_user_id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS pending_plans (
+      line_user_id TEXT PRIMARY KEY,
+      plan_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      line_user_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      first_step TEXT,
+      priority INTEGER NOT NULL DEFAULT 3,
+      start_time TEXT,
+      due_time TEXT,
+      remind_at TEXT,
+      estimated_minutes INTEGER,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_tasks_user_status ON tasks(line_user_id, status)`,
+    `CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_time)`,
+    `CREATE INDEX IF NOT EXISTS idx_tasks_remind ON tasks(remind_at)`
+  ];
+
+  for (const sql of statements) {
+    await db.prepare(sql).run();
+  }
+}
+
 async function rememberEvent(db, eventId) {
   const r = await db.prepare(
     "INSERT OR IGNORE INTO webhook_events(event_id) VALUES (?)"
@@ -465,14 +515,17 @@ async function runDiagnostics(env) {
     },
     gemini: { ok: false, model: null, status: null },
     line: { ok: false, status: null },
-    db: { ok: false, status: env.DB ? "bound" : "not_bound" }
+    db: { ok: false, status: env.DB ? "bound" : "not_bound", tables: false }
   };
 
   if (env.DB) {
     try {
+      await ensureSchema(env.DB);
       const row = await env.DB.prepare("SELECT 1 AS ok").first();
+      const table = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'").first();
       result.db.ok = row?.ok === 1;
-      result.db.status = result.db.ok ? "ok" : "query_failed";
+      result.db.tables = Boolean(table?.name);
+      result.db.status = result.db.ok && result.db.tables ? "ok" : "query_failed";
     } catch (err) {
       result.db.status = String(err?.message || err);
     }
