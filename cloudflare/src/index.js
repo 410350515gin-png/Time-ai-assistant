@@ -273,6 +273,9 @@ async function handleTaskMessage(uid, text, env) {
     return "可以呀✏️ 直接用你平常說話的方式告訴我想怎麼改。";
   }
 
+  const fast = await handleFastPath(uid, text, env);
+  if (fast) return fast;
+
   const activeContext = await activeTasksContext(env.DB, uid);
   const pendingContext = pending?.plan_items?.length
     ? "\n\n尚未確認的方案：\n" + pending.plan_items.map((x, i) =>
@@ -354,6 +357,56 @@ async function handleTaskMessage(uid, text, env) {
   }
 
   return result.reply || "我有收到，但目前還不能安全判斷你想執行哪個操作。";
+}
+
+async function handleFastPath(uid, text, env) {
+  const s = String(text || "").trim();
+
+  if (s === "系統：列出任務") {
+    return listTasksText(env.DB, uid);
+  }
+
+  const done = s.match(/^系統：完成任務:(\d+)$/u);
+  if (done) {
+    const id = Number(done[1]);
+    const task = await env.DB.prepare(
+      "UPDATE tasks SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? AND status IN ('pending','paused') RETURNING id,title"
+    ).bind(id, uid).first();
+    return task ? buildCompletionMessage(task, env) : "這項好像已經處理掉了🐽";
+  }
+
+  const del = s.match(/^系統：刪除任務:(\d+)$/u);
+  if (del) {
+    const id = Number(del[1]);
+    const task = await env.DB.prepare(
+      "SELECT id,title FROM tasks WHERE id=? AND line_user_id=? AND status IN ('pending','paused')"
+    ).bind(id, uid).first();
+    if (!task) return "找不到這項待辦了🐽";
+
+    await setPendingPlan(env.DB, uid, { action: "delete_tasks", task_ids: [id] });
+    return withDeleteActions(`要移除「${task.title}」嗎？🐽\n移除後就不會再提醒囉。`);
+  }
+
+  const snooze = s.match(/^系統：延後任務:(\d+):(\d+)$/u);
+  if (snooze) {
+    const id = Number(snooze[1]);
+    const minutes = Number(snooze[2]);
+    if (!Number.isInteger(minutes) || minutes <= 0) return null;
+
+    const when = new Date(Date.now() + minutes * 60000).toISOString();
+    const task = await env.DB.prepare(
+      `UPDATE tasks
+       SET remind_at=?, reminder_sent_at=NULL, updated_at=CURRENT_TIMESTAMP
+       WHERE id=? AND line_user_id=? AND status='pending'
+       RETURNING id,title`
+    ).bind(when, id, uid).first();
+
+    return task
+      ? `好呀🐽 我晚 ${minutes} 分鐘再叫你～`
+      : "找不到這項待辦了🐽";
+  }
+
+  return null;
 }
 
 function normalizeTaskIds(taskIds, taskId) {
@@ -1214,7 +1267,7 @@ async function activeTasksContext(db, uid) {
 
 async function listTasksText(db, uid) {
   const r = await db.prepare(
-    "SELECT id,title,status,due_time,remind_at FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') ORDER BY COALESCE(due_time,remind_at,'9999-12-31'), priority ASC LIMIT 50"
+    "SELECT id,title,status,due_time,remind_at FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') ORDER BY COALESCE(due_time,remind_at,'9999-12-31'), priority ASC LIMIT 20"
   ).bind(uid).all();
 
   const rows = r.results || [];
@@ -1234,7 +1287,7 @@ async function listTasksText(db, uid) {
     const rawTime = t.due_time || t.remind_at || null;
     const when = rawTime ? new Date(rawTime) : null;
     const item = {
-      id: t.id,
+      id: Number(t.id),
       title: String(t.title || "").trim(),
       time: when && !Number.isNaN(when.getTime()) ? when : null
     };
@@ -1284,7 +1337,32 @@ async function listTasksText(db, uid) {
     sections.push("🐽 還沒排時間\n" + buckets.anytime.map(x => formatItem(x, false)).join("\n"));
   }
 
-  return "這些還在等你喔🐽\n\n" + sections.join("\n\n");
+  const top = rows.slice(0, 4);
+  const quickItems = [];
+  for (const t of top) {
+    const short = String(t.title || "").trim().slice(0, 8);
+    quickItems.push({
+      type: "action",
+      action: {
+        type: "message",
+        label: `✅ ${short}`.slice(0, 20),
+        text: `系統：完成任務:${t.id}`
+      }
+    });
+    quickItems.push({
+      type: "action",
+      action: {
+        type: "message",
+        label: `🗑️ ${short}`.slice(0, 20),
+        text: `系統：刪除任務:${t.id}`
+      }
+    });
+  }
+
+  return {
+    text: "這些還在等你喔🐽\n\n" + sections.join("\n\n"),
+    quickReply: { items: quickItems.slice(0, 13) }
+  };
 }
 
 async function ensureReminderColumn(db) {
