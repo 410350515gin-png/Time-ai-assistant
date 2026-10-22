@@ -1,6 +1,7 @@
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
-const YES = new Set(["是","好","確認","確認執行","同意","可以","ok","yes","好啊","照這個安排","確認計畫"]);
-const NO = new Set(["否","不要","取消","不用","no","先不要","不接受"]);
+const YES = new Set(["是","好","確認","確認執行","同意","可以","ok","yes","好啊","照這個安排","確認計畫","好呀🐽"]);
+const NO = new Set(["否","不要","取消","不用","no","先不要","不接受","先不要🙈"]);
+const MODIFY = new Set(["修改","我要改","我要修改","調整","我要改✏️"]);
 
 export default {
   async fetch(request, env, ctx) {
@@ -134,7 +135,7 @@ async function processQueuedLineEvent(event, env) {
     reply = env.DB
       ? await handleTaskMessage(uid, text, env)
       : await interpretPlainText(text, env);
-    console.log("Queue AI/task reply ready", { length: reply.length });
+    console.log("Queue AI/task reply ready", { length: messageText(reply).length, quickReply: Boolean(reply?.quickReply) });
   } catch (err) {
     console.error("Queued message processing failed", {
       name: err?.name || null,
@@ -208,12 +209,16 @@ async function handleTaskMessage(uid, text, env) {
     const items = Array.isArray(pending.plan_items) ? pending.plan_items : [];
     const saved = await savePlanTasks(env.DB, uid, items);
     await clearPendingPlan(env.DB, uid);
-    return `✅ 已儲存 ${saved} 項任務。你之後可以問我「列出任務」、說「完成 #3」，或再叫我重新安排。`;
+    return `✅ 好呀🐽 已經幫你存好 ${saved} 項任務。\n之後可以直接跟我說「列出任務」或告訴我哪一項完成了。`;
   }
 
   if (pending && NO.has(lower)) {
     await clearPendingPlan(env.DB, uid);
-    return "好的，這次沒有套用任何變更。";
+    return "好～這次先不存🙈";
+  }
+
+  if (pending && MODIFY.has(lower)) {
+    return "可以呀✏️ 直接告訴我你想改哪裡，例如「第一項改到晚上 8 點」或「第二項延到明天」。";
   }
 
   if (/^(列出|查看|顯示).*(任務|待辦)|^(任務|待辦)(清單)?$/u.test(text)) {
@@ -223,7 +228,7 @@ async function handleTaskMessage(uid, text, env) {
   const relativeReminder = parseRelativeReminder(text);
   if (relativeReminder) {
     await setPendingPlan(env.DB, uid, { plan_items: [relativeReminder] });
-    return `⏰ 好，我先幫你設好：${relativeReminder.title}\n提醒時間：${fmtTaipei(relativeReminder.remind_at)}\n\n目前尚未儲存，回覆「確認」後才會正式建立。`;
+    return withPlanActions(`⏰ 好，我先幫你設好：${relativeReminder.title}\n提醒時間：${fmtTaipei(relativeReminder.remind_at)}\n\n目前還沒存，選一下👇`);
   }
 
 
@@ -254,7 +259,7 @@ async function handleTaskMessage(uid, text, env) {
     const items = sanitizePlanItems(result.plan_items);
     if (items.length) {
       await setPendingPlan(env.DB, uid, { plan_items: items });
-      return `${result.reply || "我整理好了。"}\n\n📅 建議安排（尚未儲存）：\n${formatPlan(items)}\n\n回覆「確認」才會真正寫入；也可以直接告訴我要怎麼修改，或回覆「取消」。`;
+      return withPlanActions(`${result.reply || "我整理好了。"}\n\n📅 建議安排（尚未儲存）：\n${formatPlan(items)}\n\n選一下👇`);
     }
   }
 
@@ -764,6 +769,45 @@ async function processDueReminders(env, scheduledTime) {
   }
 }
 
+function withPlanActions(text) {
+  return {
+    text,
+    quickReply: {
+      items: [
+        {
+          type: "action",
+          action: { type: "message", label: "好呀🐽", text: "好呀🐽" }
+        },
+        {
+          type: "action",
+          action: { type: "message", label: "我要改✏️", text: "我要改✏️" }
+        },
+        {
+          type: "action",
+          action: { type: "message", label: "先不要🙈", text: "先不要🙈" }
+        }
+      ]
+    }
+  };
+}
+
+function messageText(message) {
+  if (message && typeof message === "object") return String(message.text || "");
+  return String(message || "");
+}
+
+function toLineTextMessage(message) {
+  if (message && typeof message === "object") {
+    const out = {
+      type: "text",
+      text: String(message.text || "").slice(0, 5000)
+    };
+    if (message.quickReply) out.quickReply = message.quickReply;
+    return out;
+  }
+  return { type: "text", text: String(message || "").slice(0, 5000) };
+}
+
 async function pushLine(to, text, accessToken) {
   const res = await fetch("https://api.line.me/v2/bot/message/push", {
     method: "POST",
@@ -773,7 +817,7 @@ async function pushLine(to, text, accessToken) {
     },
     body: JSON.stringify({
       to,
-      messages: [{ type: "text", text: String(text || "").slice(0, 5000) }]
+      messages: [toLineTextMessage(text)]
     })
   });
 
@@ -792,7 +836,7 @@ async function replyLine(replyToken, text, accessToken) {
     },
     body: JSON.stringify({
       replyToken,
-      messages: [{ type: "text", text: String(text || "").slice(0, 5000) }]
+      messages: [toLineTextMessage(text)]
     })
   });
 
