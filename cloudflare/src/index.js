@@ -21,6 +21,10 @@ export default {
       return runDiagnostics(env);
     }
 
+    if (request.method === "GET" && url.pathname === "/diag/reminders") {
+      return runReminderDiagnostics(env);
+    }
+
     const rewardMatch = url.pathname.match(/^\/reward-images\/(\d+)\.jpg$/);
     if (request.method === "GET" && rewardMatch) {
       const index = Number(rewardMatch[1]) - 1;
@@ -47,6 +51,10 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
+    console.log("Cron scheduled event", {
+      scheduledTime: controller.scheduledTime,
+      cron: controller.cron || null
+    });
     ctx.waitUntil(processDueReminders(env, controller.scheduledTime));
   },
 
@@ -982,6 +990,65 @@ function timingSafeEqual(a, b) {
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: JSON_HEADERS });
+}
+
+async function runReminderDiagnostics(env) {
+  const result = {
+    now: new Date().toISOString(),
+    timezone: "Asia/Taipei",
+    db_bound: Boolean(env.DB),
+    pending_with_reminder: 0,
+    due_now: 0,
+    next_reminder: null,
+    recent_tasks: []
+  };
+
+  if (!env.DB) return json(result, 503);
+
+  await ensureSchema(env.DB);
+  await ensureReminderColumn(env.DB);
+
+  const now = new Date().toISOString();
+
+  const pending = await env.DB.prepare(
+    `SELECT COUNT(*) AS n
+     FROM tasks
+     WHERE status='pending'
+       AND remind_at IS NOT NULL
+       AND reminder_sent_at IS NULL`
+  ).first();
+
+  const due = await env.DB.prepare(
+    `SELECT COUNT(*) AS n
+     FROM tasks
+     WHERE status='pending'
+       AND remind_at IS NOT NULL
+       AND remind_at <= ?
+       AND reminder_sent_at IS NULL`
+  ).bind(now).first();
+
+  const next = await env.DB.prepare(
+    `SELECT id,title,remind_at,due_time,reminder_sent_at
+     FROM tasks
+     WHERE status='pending'
+       AND remind_at IS NOT NULL
+       AND reminder_sent_at IS NULL
+     ORDER BY remind_at ASC
+     LIMIT 1`
+  ).first();
+
+  const recent = await env.DB.prepare(
+    `SELECT id,title,status,remind_at,due_time,reminder_sent_at
+     FROM tasks
+     ORDER BY id DESC
+     LIMIT 8`
+  ).all();
+
+  result.pending_with_reminder = Number(pending?.n || 0);
+  result.due_now = Number(due?.n || 0);
+  result.next_reminder = next || null;
+  result.recent_tasks = recent.results || [];
+  return json(result);
 }
 
 async function runDiagnostics(env) {
