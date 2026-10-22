@@ -59,7 +59,10 @@ export default {
       scheduledTime: controller.scheduledTime,
       cron: controller.cron || null
     });
-    ctx.waitUntil(processDueReminders(env, controller.scheduledTime));
+    ctx.waitUntil(Promise.all([
+      processDueReminders(env, controller.scheduledTime),
+      processEveningCheckins(env, controller.scheduledTime)
+    ]));
   },
 
   async queue(batch, env) {
@@ -1693,6 +1696,15 @@ async function ensureSchema(db) {
       event_value TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )`,
+    `CREATE TABLE IF NOT EXISTS daily_checkins (
+      line_user_id TEXT NOT NULL,
+      date_key TEXT NOT NULL,
+      mood TEXT,
+      emotion_tag TEXT,
+      sent_at TEXT,
+      responded_at TEXT,
+      PRIMARY KEY(line_user_id, date_key)
+    )`,
     `CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at)`,
     `CREATE INDEX IF NOT EXISTS idx_tasks_user_status ON tasks(line_user_id, status)`,
     `CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_time)`,
@@ -1713,7 +1725,9 @@ async function rememberEvent(db, eventId) {
 
 async function ensureUser(db, uid) {
   await db.prepare(
-    "INSERT OR IGNORE INTO users(line_user_id) VALUES (?)"
+    `INSERT INTO users(line_user_id,updated_at)
+     VALUES (?,CURRENT_TIMESTAMP)
+     ON CONFLICT(line_user_id) DO UPDATE SET updated_at=CURRENT_TIMESTAMP`
   ).bind(uid).run();
 }
 
@@ -1930,6 +1944,101 @@ async function logTaskEvent(db, taskId, uid, type, value = null) {
       .bind(taskId, uid, type, value).run();
   } catch (err) {
     console.warn("Task event log failed", { task_id: taskId, type, message: String(err?.message || err) });
+  }
+}
+
+function taipeiDateParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Taipei",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false
+  }).formatToParts(date);
+  const get = type => parts.find(p => p.type === type)?.value;
+  return {
+    dateKey: `${get("year")}-${get("month")}-${get("day")}`,
+    hour: Number(get("hour")),
+    minute: Number(get("minute"))
+  };
+}
+
+function taipeiDayBoundsUtc(dateKey) {
+  const start = new Date(`${dateKey}T00:00:00+08:00`);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+
+async function processEveningCheckins(env, scheduledTime) {
+  if (!env.DB || !env.CHANNEL_ACCESS_TOKEN) return;
+
+  const now = new Date(scheduledTime || Date.now());
+  const local = taipeiDateParts(now);
+
+  // 10-minute retry window so a transient LINE failure can recover.
+  if (local.hour !== 22 || local.minute < 30 || local.minute > 39) return;
+
+  await ensureSchema(env.DB);
+  const { start, end } = taipeiDayBoundsUtc(local.dateKey);
+
+  const users = await env.DB.prepare(
+    `SELECT line_user_id FROM users
+     WHERE updated_at >= datetime('now','-30 day')
+     ORDER BY updated_at DESC
+     LIMIT 200`
+  ).all();
+
+  for (const row of (users.results || [])) {
+    const uid = row.line_user_id;
+    if (!uid) continue;
+
+    const existing = await env.DB.prepare(
+      "SELECT sent_at FROM daily_checkins WHERE line_user_id=? AND date_key=?"
+    ).bind(uid, local.dateKey).first();
+    if (existing?.sent_at) continue;
+
+    const completed = await env.DB.prepare(
+      `SELECT title FROM tasks
+       WHERE line_user_id=? AND status='completed'
+         AND updated_at >= ? AND updated_at < ?
+       ORDER BY updated_at ASC
+       LIMIT 8`
+    ).bind(uid, start, end).all();
+
+    const titles = (completed.results || [])
+      .map(x => String(x.title || "").trim())
+      .filter(Boolean);
+
+    const summary = titles.length
+      ? ["今天你完成了：", ...titles.slice(0, 5).map(x => `✅ ${x}`), titles.length > 5 ? `還有 ${titles.length - 5} 件 ✨` : null]
+          .filter(Boolean).join("\n")
+      : "今天沒有需要用完成數量證明什麼。能走到一天尾聲，就先讓自己收工一下🐽";
+
+    const message = {
+      text: `今天辛苦啦🐽\n\n${summary}\n\n今天整體感覺怎麼樣？`,
+      quickReply: {
+        items: [
+          { type: "action", action: hiddenPostbackAction("😄 很不錯", `系統：晚間心情:${local.dateKey}:great`, "😄 今天很不錯") },
+          { type: "action", action: hiddenPostbackAction("🙂 還可以", `系統：晚間心情:${local.dateKey}:good`, "🙂 今天還可以") },
+          { type: "action", action: hiddenPostbackAction("😐 普通", `系統：晚間心情:${local.dateKey}:neutral`, "😐 今天普通") },
+          { type: "action", action: hiddenPostbackAction("😮‍💨 有點累", `系統：晚間心情:${local.dateKey}:tired`, "😮‍💨 今天有點累") },
+          { type: "action", action: hiddenPostbackAction("😞 很低落", `系統：晚間心情:${local.dateKey}:low`, "😞 今天很低落") }
+        ]
+      }
+    };
+
+    try {
+      await pushLine(uid, message, env.CHANNEL_ACCESS_TOKEN);
+      await env.DB.prepare(
+        `INSERT INTO daily_checkins(line_user_id,date_key,sent_at)
+         VALUES (?,?,CURRENT_TIMESTAMP)
+         ON CONFLICT(line_user_id,date_key) DO UPDATE SET sent_at=COALESCE(daily_checkins.sent_at,excluded.sent_at)`
+      ).bind(uid, local.dateKey).run();
+    } catch (err) {
+      console.error("Evening check-in push failed", {
+        date_key: local.dateKey,
+        name: err?.name || null,
+        message: err?.message || String(err)
+      });
+    }
   }
 }
 
