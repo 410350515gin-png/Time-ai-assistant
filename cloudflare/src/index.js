@@ -1,7 +1,7 @@
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
@@ -13,14 +13,14 @@ export default {
     }
 
     if (request.method === "POST" && (url.pathname === "/callback" || url.pathname === "/webhook")) {
-      return handleLineWebhook(request, env);
+      return handleLineWebhook(request, env, ctx);
     }
 
     return new Response("Not Found", { status: 404 });
   },
 };
 
-async function handleLineWebhook(request, env) {
+async function handleLineWebhook(request, env, ctx) {
   console.log("LINE webhook received", request.method, new URL(request.url).pathname);
   const raw = await request.text();
   const signature = request.headers.get("x-line-signature") || "";
@@ -45,6 +45,12 @@ async function handleLineWebhook(request, env) {
   const events = Array.isArray(body.events) ? body.events : [];
   console.log("LINE events count", events.length);
 
+  ctx.waitUntil(processLineEvents(events, env));
+
+  return json({ status: "accepted" });
+}
+
+async function processLineEvents(events, env) {
   for (const event of events) {
     if (event?.type !== "message" || event?.message?.type !== "text") continue;
 
@@ -69,8 +75,6 @@ async function handleLineWebhook(request, env) {
       console.error("LINE reply failed", err);
     }
   }
-
-  return json({ status: "ok" });
 }
 
 async function interpretWithGemini(message, env) {
@@ -93,7 +97,7 @@ ${message}`;
   for (const model of models) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 7000);
+      const timeout = setTimeout(() => controller.abort(), 12000);
 
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`,
