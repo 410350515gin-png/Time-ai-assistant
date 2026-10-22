@@ -1,4 +1,10 @@
-fastapi
-uvicorn
-line-bot-sdk
-google-genai
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.8,<3.0
+pydantic-settings>=2.4,<3.0
+SQLAlchemy>=2.0.32,<3.0
+psycopg2-binary>=2.9.9
+google-genai>=1.0,<2.0
+line-bot-sdk>=3.14,<4.0
+APScheduler>=3.10.4,<4.0
+python-dateutil>=2.9.0
