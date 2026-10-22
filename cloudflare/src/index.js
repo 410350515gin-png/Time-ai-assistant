@@ -857,13 +857,26 @@ async function processDueReminders(env, scheduledTime) {
   ).bind(now).all();
 
   for (const task of (due.results || [])) {
-    const text = [
-      "⏰ 提醒時間到囉",
-      `📌 ${task.title}`,
-      task.due_time ? `截止：${fmtTaipei(task.due_time)}` : null,
-      "",
-      "完成後可以直接回我「完成 #"+task.id+"」。"
-    ].filter(x => x !== null).join("\n");
+    const text = {
+      text: [
+        `📌 ${task.title}`,
+        task.due_time ? `⏰ 截止：${fmtTaipei(task.due_time)}` : null,
+        "",
+        "做完就直接按下面 👇"
+      ].filter(x => x !== null).join("\n"),
+      quickReply: {
+        items: [
+          {
+            type: "action",
+            action: {
+              type: "message",
+              label: "完成了✅",
+              text: `完成 #${task.id}`
+            }
+          }
+        ]
+      }
+    };
 
     try {
       await pushLine(task.line_user_id, text, env.CHANNEL_ACCESS_TOKEN);
