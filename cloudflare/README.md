@@ -19,3 +19,6 @@ This first migration step intentionally does not write tasks to the database yet
 LINE -> Cloudflare Worker -> Gemini -> LINE reply
 
 After this path is stable, add durable idempotency, queueing and task persistence.
+
+
+Build trigger: 2026-10-22
