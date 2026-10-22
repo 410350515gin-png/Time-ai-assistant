@@ -17,6 +17,7 @@ export default {
 };
 
 async function handleLineWebhook(request, env) {
+  console.log("LINE webhook received", request.method, new URL(request.url).pathname);
   const raw = await request.text();
   const signature = request.headers.get("x-line-signature") || "";
 
@@ -25,7 +26,10 @@ async function handleLineWebhook(request, env) {
   }
 
   const valid = await verifyLineSignature(raw, signature, env.CHANNEL_SECRET);
-  if (!valid) return json({ error: "invalid signature" }, 400);
+  if (!valid) {
+    console.error("LINE signature invalid");
+    return json({ error: "invalid signature" }, 400);
+  }
 
   let body;
   try {
@@ -35,17 +39,20 @@ async function handleLineWebhook(request, env) {
   }
 
   const events = Array.isArray(body.events) ? body.events : [];
+  console.log("LINE events count", events.length);
 
   for (const event of events) {
     if (event?.type !== "message" || event?.message?.type !== "text") continue;
 
     const text = (event.message.text || "").trim();
+    console.log("LINE text event", { hasReplyToken: Boolean(event.replyToken), textLength: text.length });
     const replyToken = event.replyToken;
     if (!text || !replyToken) continue;
 
     let reply;
     try {
       reply = await interpretWithGemini(text, env);
+      console.log("AI reply ready", { length: reply.length });
     } catch (err) {
       console.error("AI failed", err);
       reply = "AI 服務暫時繁忙，但 LINE 連線正常。請稍後再傳一次。";
@@ -53,6 +60,7 @@ async function handleLineWebhook(request, env) {
 
     try {
       await replyLine(replyToken, reply, env.CHANNEL_ACCESS_TOKEN);
+      console.log("LINE reply sent successfully");
     } catch (err) {
       console.error("LINE reply failed", err);
     }
