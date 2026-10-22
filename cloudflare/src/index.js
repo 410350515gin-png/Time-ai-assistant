@@ -147,6 +147,9 @@ async function processQueuedLineEvent(event, env) {
     await ensureReminderColumn(env.DB);
     await ensureRecurrenceColumn(env.DB);
     await ensureTaskTypeColumn(env.DB);
+    await env.DB.prepare(
+      "UPDATE tasks SET task_type='routine' WHERE recurrence_json IS NOT NULL AND recurrence_json <> '' AND task_type='daily'"
+    ).run();
     await ensureTaskTypeColumn(env.DB);
   }
 
