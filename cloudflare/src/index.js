@@ -1170,7 +1170,7 @@ ${context || "目前沒有"}
 
 規則：
 1. 使用者一次給多個任務時，全部處理。
-2. 找出依賴關係、優先順序、第一步、合理開始時間與截止時間。
+2. 找出依賴關係、優先順序、第一步、合理開始時間與截止時間。first_step 必須是 2–10 分鐘內能立刻開始、可觀察完成的動作，不可只是把原任務換句話說。
 3. 不要假裝資料已經儲存；你只能提出方案。
 4. 若資訊不足，不要亂編固定行程；可以用合理建議，但要保守。
 5. 僅輸出 JSON，不要 markdown。
@@ -1198,6 +1198,7 @@ ${context || "目前沒有"}
 若有 recurrence，task_type 必須是 routine。
 22. 每個任務都要分類 task_type：routine=固定重複的例行任務/課表/固定習慣；goal=有成果、截止或需要多步驟推進的目標/報告/專案；daily=一次性的日常瑣事，例如洗衣、洗澡、拿包裹。
 23. 有 recurrence 的任務原則上 task_type=routine。
+24. 對大型、模糊或容易拖延的目標，優先降低啟動門檻：第一步只要求開始，不要求一次完成整個成果。避免責備、羞辱、罪惡感或「應該更自律」式語氣。
 
 JSON schema：
 {
@@ -1322,7 +1323,7 @@ function buildLocalFallback(message) {
   const items = parts.map((p, i) => ({
     title: p.slice(0, 120),
     description: null,
-    first_step: "先確認需要完成的具體內容與所需資料",
+    first_step: "先花 5 分鐘確認下一個最小可執行動作",
     priority: Math.min(5, i + 1),
     start_time: null,
     due_time: null,
@@ -1632,10 +1633,10 @@ async function savePlanTasks(db, uid, items) {
 
 async function activeTasksContext(db, uid) {
   const r = await db.prepare(
-    "SELECT id,title,status,start_time,due_time,first_step,task_type FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') ORDER BY COALESCE(due_time,'9999-12-31'), priority ASC LIMIT 40"
+    "SELECT id,title,status,start_time,due_time,first_step,task_type,stuck_count,last_barrier FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') ORDER BY COALESCE(due_time,'9999-12-31'), priority ASC LIMIT 40"
   ).bind(uid).all();
   return (r.results || []).map(t =>
-    `id=${t.id};title=${t.title};type=${t.task_type || "daily"};status=${t.status};start=${t.start_time || ""};due=${t.due_time || ""};first_step=${t.first_step || ""}`
+    `id=${t.id};title=${t.title};type=${t.task_type || "daily"};status=${t.status};stuck=${Number(t.stuck_count || 0)};barrier=${t.last_barrier || ""};start=${t.start_time || ""};due=${t.due_time || ""};first_step=${t.first_step || ""}`
   ).join("\n");
 }
 
