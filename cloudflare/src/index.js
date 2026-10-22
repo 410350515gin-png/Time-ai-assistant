@@ -378,12 +378,34 @@ function parseAbsoluteReminder(text) {
   };
 }
 
+function parseChineseNumber(input) {
+  const s = String(input || "").trim();
+  if (/^\d+$/.test(s)) return Number(s);
+
+  const digitMap = {
+    "零": 0, "〇": 0,
+    "一": 1, "二": 2, "兩": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9
+  };
+
+  if (s === "十") return 10;
+  if (s.includes("十")) {
+    const [a, b] = s.split("十");
+    const tens = a ? digitMap[a] : 1;
+    const ones = b ? digitMap[b] : 0;
+    if (tens === undefined || ones === undefined) return NaN;
+    return tens * 10 + ones;
+  }
+
+  return digitMap[s] ?? NaN;
+}
+
 function parseRelativeReminder(text) {
   const s = String(text || "").trim();
-  const m = s.match(/(?:^|\s)(\d+)\s*(分鐘|小時)後提醒我\s*(.+)$/u);
+  const m = s.match(/(?:^|\s)(\d+|[零〇一二兩三四五六七八九十]+)\s*(分鐘|小時)後(?:到時候)?\s*提醒我\s*(.+)$/u);
   if (!m) return null;
 
-  const amount = Number(m[1]);
+  const amount = parseChineseNumber(m[1]);
   if (!Number.isFinite(amount) || amount <= 0) return null;
 
   const unit = m[2];
@@ -395,14 +417,14 @@ function parseRelativeReminder(text) {
 
   return {
     title: title.slice(0, 200),
-    description: `相對時間提醒：${amount}${unit}後`,
+    description: `相對時間提醒：${m[1]}${unit}後`,
     first_step: title.slice(0, 500),
     priority: 1,
     start_time: when,
     due_time: when,
     remind_at: when,
     estimated_minutes: null,
-    reason: `依照使用者指定的「${amount}${unit}後」精準計算，不交由 AI 推算。`
+    reason: `依照使用者指定的「${m[1]}${unit}後」精準計算，不交由 AI 推算。`
   };
 }
 
