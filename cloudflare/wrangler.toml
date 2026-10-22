@@ -5,3 +5,9 @@ compatibility_date = "2026-10-22"
 [vars]
 TIMEZONE = "Asia/Taipei"
 GEMINI_MODELS = "gemini-3.8-flash,gemini-3.5-flash-lite"
+
+
+[[d1_databases]]
+binding = "DB"
+database_name = "time-ai-assistant-db"
+database_id = "db4d34c0-2747-4077-a560-20b89e8aa2cd"
