@@ -534,7 +534,6 @@ function buildTaskHubMessage() {
           { type: "text", text: "我幫你分成三區，找起來比較快～", wrap: true, size: "sm" },
           {
             type: "button",
-            style: "primary",
             action: hiddenPostbackAction("🔁 例行性任務", "系統：任務分類:routine", "查看例行性任務 🔁")
           },
           {
@@ -603,17 +602,17 @@ async function listTasksByType(db, uid, type) {
             {
               type: "button",
               height: "sm",
-              action: hiddenPostbackAction("完成✅", `系統：完成任務:${t.id}`, `完成「${String(t.title || "").slice(0, 40)}」✅`)
+              action: hiddenPostbackAction("✅ 完成", `系統：完成任務:${t.id}`, `完成「${String(t.title || "").slice(0, 40)}」✅`)
             },
             {
               type: "button",
               height: "sm",
-              action: hiddenPostbackAction("分類🏷️", `系統：改分類:${t.id}`, `修改「${String(t.title || "").slice(0, 40)}」分類 🏷️`)
+              action: hiddenPostbackAction("🏷 分類", `系統：改分類:${t.id}`, `修改「${String(t.title || "").slice(0, 40)}」分類 🏷️`)
             },
             {
               type: "button",
               height: "sm",
-              action: hiddenPostbackAction("刪除🗑️", `系統：刪除任務:${t.id}`, `刪除「${String(t.title || "").slice(0, 40)}」🗑️`)
+              action: hiddenPostbackAction("🗑 刪除", `系統：刪除任務:${t.id}`, `刪除「${String(t.title || "").slice(0, 40)}」🗑️`)
             }
           ]
         }
