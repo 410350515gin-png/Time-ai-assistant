@@ -327,7 +327,9 @@ async function handleTaskMessage(uid, text, env) {
     let items = sanitizePlanItems(result.plan_items);
 
     if (result.intent === "create_reminder" && items.length) {
-      items = items.map(item => applyAiTimeSemantics(item, result.time_semantics));
+      items = items.map(item => normalizeReminderItem(
+        applyAiTimeSemantics(item, result.time_semantics)
+      ));
     }
 
     // Safety validation only: AI understands language; program validates execution data.
@@ -339,7 +341,14 @@ async function handleTaskMessage(uid, text, env) {
 
     if (items.length) {
       await setPendingPlan(env.DB, uid, { plan_items: items });
-      const heading = result.intent === "create_reminder" ? "⏰ 我理解成這樣：" : "📅 我整理成這樣：";
+      if (result.intent === "create_reminder") {
+        const first = items[0];
+        return withPlanActions(
+          `好呀🐽 我先幫你排著～\n📌 ${first.title}\n⏰ 提醒：${fmtTaipei(first.remind_at)}\n\n還沒正式存，選一下👇`
+        );
+      }
+
+      const heading = "📅 我幫你整理好了🐽";
       return withPlanActions(`${result.reply || heading}\n\n${formatPlan(items)}\n\n選一下👇`);
     }
   }
@@ -350,6 +359,27 @@ async function handleTaskMessage(uid, text, env) {
 function normalizeTaskIds(taskIds, taskId) {
   const raw = Array.isArray(taskIds) ? taskIds : (taskId !== null && taskId !== undefined ? [taskId] : []);
   return [...new Set(raw.map(Number).filter(Number.isInteger))].slice(0, 50);
+}
+
+function normalizeReminderItem(item) {
+  if (!item) return item;
+
+  let title = String(item.title || "").trim();
+  title = title
+    .replace(/^(提醒我|記得提醒我|到時候提醒我|叫我|通知我)\s*/u, "")
+    .replace(/^去\s+/u, "去")
+    .trim();
+
+  return {
+    ...item,
+    title: title || String(item.title || "").trim(),
+    description: item.description || null,
+    first_step: title || String(item.first_step || item.title || "").trim(),
+    // A reminder is a point-in-time event, not a 15-minute work block.
+    start_time: null,
+    due_time: null,
+    estimated_minutes: null
+  };
 }
 
 function applyAiTimeSemantics(item, semantics) {
@@ -823,7 +853,7 @@ ${context || "目前沒有"}
 10. 所有自然語言意圖都由你判斷，不要求使用者記固定指令。例：「都刪掉」「清空一下」「這些不要了」可判斷為 delete_all_tasks；「把叫弟弟起床那個刪掉」為 delete_task；「這個做完了」為 complete_task。
 11. delete_task / complete_task 必須根據「現有待辦」選出真正存在的 task id。不可自行捏造 id。找不到唯一對應時，task_ids 留空，reply 說明需要使用者再指明。
 12. delete_all_tasks 只代表使用者要移除目前全部待辦，不要建立一個名為「刪除全部任務」的新任務。
-13. 使用者是在要求提醒時，intent 使用 create_reminder，並在 plan_items 中輸出真正的任務名稱與 remind_at。
+13. 使用者是在要求提醒時，intent 使用 create_reminder，並在 plan_items 中輸出真正的任務名稱與 remind_at。title 只寫行動本身，例如「去洗澡」，不要寫「提醒我去洗澡」。提醒型任務的 start_time、due_time、estimated_minutes 一律設 null。
 14. 時間解析一律以 Asia/Taipei 為準。相對時間（例如「兩分鐘後」「半小時後」「三天後」）必須以現在台灣時間精確相加。
 15. 若使用者只是說「完成」「好了」「做完了」，優先參考現有任務與最近上下文判斷；若無法唯一判定，不要猜 task id。
 16. 若提醒時間是相對時間，例如「兩分鐘後」「半小時後」「1.5 小時後」「三天後」，你負責理解並填 time_semantics；不要自己做最終時間算術。kind=relative，amount 填數值（半小時 = 30 minute），unit 只能是 minute|hour|day|week。
