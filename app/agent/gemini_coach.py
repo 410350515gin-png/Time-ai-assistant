@@ -35,26 +35,16 @@ def interpret_message(message,context=""):
         "請嚴格只輸出一個 JSON 物件，不要加 markdown 或其他文字。"
     )
     try:
-        interaction=client.interactions.create(
+        r=client.models.generate_content(
             model=settings.GEMINI_MODEL,
-            system_instruction=SYSTEM_COACH_PROMPT,
-            input=user_input,
-            generation_config={"max_output_tokens":2500},
+            contents=user_input,
+            config={
+                "system_instruction":SYSTEM_COACH_PROMPT,
+                "response_mime_type":"application/json",
+                "max_output_tokens":2500,
+            },
         )
-        return _validate(_parse_json(interaction.output_text))
+        return _validate(_parse_json(r.text))
     except Exception:
-        logger.exception("Interactions API failed; falling back to generate_content")
-        try:
-            r=client.models.generate_content(
-                model=settings.GEMINI_MODEL,
-                contents=user_input,
-                config={
-                    "system_instruction":SYSTEM_COACH_PROMPT,
-                    "response_mime_type":"application/json",
-                    "max_output_tokens":2500,
-                },
-            )
-            return _validate(_parse_json(r.text))
-        except Exception:
-            logger.exception("Gemini fallback failed")
-            return {"intent":"chat","reply":"AI 服務暫時忙碌，請稍後再傳一次；你的任務資料沒有被寫入。"}
+        logger.exception("Gemini generate_content failed")
+        return {"intent":"chat","reply":"AI 服務暫時忙碌，請稍後再傳一次；你的任務資料沒有被寫入。"}
