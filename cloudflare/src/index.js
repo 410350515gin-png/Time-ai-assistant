@@ -301,6 +301,15 @@ async function handleTaskMessage(uid, text, env) {
     return "可以呀✏️ 直接用你平常說話的方式告訴我想怎麼改。";
   }
 
+  const incompleteReply = /^(還沒|還沒有|還沒做|還沒完成|還沒開始|尚未|還沒弄|還沒用)$/u.test(String(text || "").trim());
+  if (!pending && incompleteReply) {
+    const recent = await findRecentRemindedTask(env.DB, uid);
+    if (recent) {
+      const task = await markTaskStuck(env.DB, uid, Number(recent.id), "natural_incomplete");
+      if (task) return buildStuckIntervention(task);
+    }
+  }
+
   const fast = await handleFastPath(uid, text, env);
   if (fast) return fast;
 
@@ -403,6 +412,51 @@ async function handleTaskMessage(uid, text, env) {
   }
 
   return result.reply || "我有收到，但目前還不能安全判斷你想執行哪個操作。";
+}
+
+async function findRecentRemindedTask(db, uid) {
+  // Prefer an explicit reminder event from the last 6 hours.
+  const eventTask = await db.prepare(
+    `SELECT t.id,t.title,t.first_step,t.due_time,t.task_type,t.stuck_count,t.last_barrier
+     FROM task_events e
+     JOIN tasks t ON t.id=e.task_id
+     WHERE e.line_user_id=?
+       AND e.event_type='reminder_sent'
+       AND e.created_at >= datetime('now','-6 hours')
+       AND t.status IN ('pending','paused')
+     ORDER BY e.created_at DESC
+     LIMIT 1`
+  ).bind(uid).first();
+  if (eventTask) return eventTask;
+
+  // Backward-compatible fallback for reminders sent before event logging existed.
+  return db.prepare(
+    `SELECT id,title,first_step,due_time,task_type,stuck_count,last_barrier
+     FROM tasks
+     WHERE line_user_id=?
+       AND status IN ('pending','paused')
+       AND reminder_sent_at IS NOT NULL
+       AND reminder_sent_at >= datetime('now','-6 hours')
+     ORDER BY reminder_sent_at DESC
+     LIMIT 1`
+  ).bind(uid).first();
+}
+
+async function markTaskStuck(db, uid, id, source = "button") {
+  const task = await db.prepare(
+    `UPDATE tasks
+     SET stuck_count=COALESCE(stuck_count,0)+1, updated_at=CURRENT_TIMESTAMP
+     WHERE id=? AND line_user_id=? AND status IN ('pending','paused')
+     RETURNING id,title,first_step,due_time,task_type,stuck_count,last_barrier`
+  ).bind(id, uid).first();
+
+  if (task) {
+    await logTaskEvent(db, id, uid, "stuck", JSON.stringify({
+      count: Number(task.stuck_count || 1),
+      source
+    }));
+  }
+  return task;
 }
 
 async function handleFastPath(uid, text, env) {
@@ -524,14 +578,8 @@ async function handleFastPath(uid, text, env) {
   const stuck = s.match(/^系統：卡住任務:(\d+)$/u);
   if (stuck) {
     const id = Number(stuck[1]);
-    const task = await env.DB.prepare(
-      `UPDATE tasks
-       SET stuck_count=COALESCE(stuck_count,0)+1, updated_at=CURRENT_TIMESTAMP
-       WHERE id=? AND line_user_id=? AND status IN ('pending','paused')
-       RETURNING id,title,first_step,due_time,task_type,stuck_count,last_barrier`
-    ).bind(id, uid).first();
+    const task = await markTaskStuck(env.DB, uid, id, "button");
     if (!task) return "找不到這項待辦了🐽";
-    await logTaskEvent(env.DB, id, uid, "stuck", String(task.stuck_count));
     return buildStuckIntervention(task);
   }
 
@@ -2146,6 +2194,7 @@ async function processDueReminders(env, scheduledTime) {
 
     try {
       await pushLine(task.line_user_id, text, env.CHANNEL_ACCESS_TOKEN);
+      await logTaskEvent(env.DB, Number(task.id), task.line_user_id, "reminder_sent", task.remind_at || null);
       const recurrence = parseRecurrenceJson(task.recurrence_json);
       const next = recurrence ? computeNextOccurrence(task.remind_at, recurrence) : null;
 
