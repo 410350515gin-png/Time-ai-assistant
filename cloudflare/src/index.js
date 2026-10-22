@@ -229,10 +229,35 @@ async function processLineEvents(events, env) {
 
 async function handleTaskMessage(uid, text, env) {
   await ensureUser(env.DB, uid);
-  const lower = text.toLowerCase();
+  const lower = String(text || "").trim().toLowerCase();
 
+  // System button actions only. Natural-language intent is handled by AI below.
   const pending = await getPendingPlan(env.DB, uid);
+
   if (pending && YES.has(lower)) {
+    if (pending.action === "delete_all") {
+      const r = await env.DB.prepare(
+        "UPDATE tasks SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE line_user_id=? AND status IN ('pending','paused')"
+      ).bind(uid).run();
+      await clearPendingPlan(env.DB, uid);
+      return `🗑️ 已移除 ${Number(r?.meta?.changes || 0)} 項待辦任務，後續提醒也會停止。`;
+    }
+
+    if (pending.action === "delete_tasks") {
+      const ids = Array.isArray(pending.task_ids) ? pending.task_ids.filter(Number.isInteger) : [];
+      if (!ids.length) {
+        await clearPendingPlan(env.DB, uid);
+        return "找不到要刪除的任務。";
+      }
+      const placeholders = ids.map(() => "?").join(",");
+      const r = await env.DB.prepare(
+        `UPDATE tasks SET status='cancelled', updated_at=CURRENT_TIMESTAMP
+         WHERE line_user_id=? AND status IN ('pending','paused') AND id IN (${placeholders})`
+      ).bind(uid, ...ids).run();
+      await clearPendingPlan(env.DB, uid);
+      return `🗑️ 已移除 ${Number(r?.meta?.changes || 0)} 項任務，之後不會再提醒。`;
+    }
+
     const items = Array.isArray(pending.plan_items) ? pending.plan_items : [];
     const saved = await savePlanTasks(env.DB, uid, items);
     await clearPendingPlan(env.DB, uid);
@@ -241,89 +266,11 @@ async function handleTaskMessage(uid, text, env) {
 
   if (pending && NO.has(lower)) {
     await clearPendingPlan(env.DB, uid);
-    return "好～這次先不存🙈";
+    return "好～這次先不執行🙈";
   }
 
   if (pending && MODIFY.has(lower)) {
-    return "可以呀✏️ 直接告訴我你想改哪裡，例如「第一項改到晚上 8 點」或「第二項延到明天」。";
-  }
-
-  if (/^(列出|查看|顯示).*(任務|待辦)|^(任務|待辦)(清單)?$/u.test(text)) {
-    return listTasksText(env.DB, uid);
-  }
-
-  if (/^(全部刪除|刪除全部|刪除全部任務|全部任務刪除|清空任務|清空待辦|清空全部任務)$/u.test(text)) {
-    return {
-      text: "要把目前所有待辦任務都移除嗎？\n這會停止之後的提醒，但我會保留歷史紀錄。",
-      quickReply: {
-        items: [
-          {
-            type: "action",
-            action: { type: "message", label: "確定刪除🗑️", text: "確認刪除全部任務" }
-          },
-          {
-            type: "action",
-            action: { type: "message", label: "先不要🙈", text: "取消刪除全部任務" }
-          }
-        ]
-      }
-    };
-  }
-
-  if (text === "確認刪除全部任務") {
-    const r = await env.DB.prepare(
-      "UPDATE tasks SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE line_user_id=? AND status IN ('pending','paused')"
-    ).bind(uid).run();
-    const n = Number(r?.meta?.changes || 0);
-    return `🗑️ 已移除 ${n} 項待辦任務，後續提醒也會停止。`;
-  }
-
-  if (text === "取消刪除全部任務") {
-    return "好～先保留目前的任務🙈";
-  }
-
-  const deleteMatch = text.match(/^(?:刪除|移除|取消任務)\s*#?(\d+)$/u);
-  if (deleteMatch) {
-    const id = Number(deleteMatch[1]);
-    const task = await env.DB.prepare(
-      "UPDATE tasks SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? AND status IN ('pending','paused') RETURNING id,title"
-    ).bind(id, uid).first();
-    return task ? `🗑️ 已移除「${task.title}」，之後不會再提醒。` : "找不到這個待辦任務。";
-  }
-
-  const smartReminder = await resolveReminderIntent(text, env);
-  if (smartReminder) {
-    await setPendingPlan(env.DB, uid, { plan_items: [smartReminder] });
-    return withPlanActions(`⏰ 好，我先幫你設好：${smartReminder.title}\n提醒時間：${fmtTaipei(smartReminder.remind_at)}\n\n目前還沒存，選一下👇`);
-  }
-
-
-  if (/^(完成|完成了|做完|做完了|好了|搞定)$/u.test(text)) {
-    const recent = await env.DB.prepare(
-      `SELECT id,title
-       FROM tasks
-       WHERE line_user_id=?
-         AND status='pending'
-         AND reminder_sent_at IS NOT NULL
-       ORDER BY reminder_sent_at DESC, id DESC
-       LIMIT 1`
-    ).bind(uid).first();
-
-    if (recent) {
-      const task = await env.DB.prepare(
-        "UPDATE tasks SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? AND status='pending' RETURNING id,title"
-      ).bind(recent.id, uid).first();
-      if (task) return buildCompletionMessage(task, env);
-    }
-  }
-
-  const completeMatch = text.match(/(?:完成|做完|完成任務)\s*#?(\d+)/u);
-  if (completeMatch) {
-    const id = Number(completeMatch[1]);
-    const task = await env.DB.prepare(
-      "UPDATE tasks SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? RETURNING id,title"
-    ).bind(id, uid).first();
-    return task ? buildCompletionMessage(task, env) : "找不到這個任務編號。";
+    return "可以呀✏️ 直接用你平常說話的方式告訴我想怎麼改。";
   }
 
   const context = await activeTasksContext(env.DB, uid);
@@ -333,22 +280,87 @@ async function handleTaskMessage(uid, text, env) {
     return listTasksText(env.DB, uid);
   }
 
-  if (result.intent === "complete_task" && Number.isInteger(result.task_id)) {
+  if (result.intent === "complete_task") {
+    const ids = normalizeTaskIds(result.task_ids, result.task_id);
+    if (!ids.length) return result.reply || "我還不能確定你要完成哪一項任務。";
+
+    const id = ids[0];
     const task = await env.DB.prepare(
-      "UPDATE tasks SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? RETURNING id,title"
-    ).bind(result.task_id, uid).first();
-    return task ? buildCompletionMessage(task, env) : "找不到這個任務編號。";
+      "UPDATE tasks SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? AND status IN ('pending','paused') RETURNING id,title"
+    ).bind(id, uid).first();
+    return task ? buildCompletionMessage(task, env) : "找不到這個待辦任務。";
   }
 
-  if (result.intent === "propose_plan" || result.intent === "revise_plan") {
-    const items = sanitizePlanItems(result.plan_items);
+  if (result.intent === "delete_all_tasks") {
+    await setPendingPlan(env.DB, uid, { action: "delete_all" });
+    return withDeleteActions("要把目前所有待辦任務都移除嗎？\n這會停止後續提醒，但會保留歷史紀錄。");
+  }
+
+  if (result.intent === "delete_task") {
+    const ids = normalizeTaskIds(result.task_ids, result.task_id);
+    if (!ids.length) return result.reply || "我還不能確定你想刪除哪一項任務。";
+
+    const rows = await env.DB.prepare(
+      `SELECT id,title FROM tasks
+       WHERE line_user_id=? AND status IN ('pending','paused')
+       ORDER BY id DESC LIMIT 100`
+    ).bind(uid).all();
+    const selected = (rows.results || []).filter(t => ids.includes(Number(t.id)));
+    if (!selected.length) return "找不到你要刪除的待辦任務。";
+
+    await setPendingPlan(env.DB, uid, {
+      action: "delete_tasks",
+      task_ids: selected.map(t => Number(t.id))
+    });
+
+    const names = selected.map(t => `「${t.title}」`).join("、");
+    return withDeleteActions(`要移除 ${names} 嗎？\n移除後會停止提醒，但會保留歷史紀錄。`);
+  }
+
+  if (result.intent === "propose_plan" || result.intent === "revise_plan" || result.intent === "create_reminder") {
+    let items = sanitizePlanItems(result.plan_items);
+
+    // Safety validation only: AI understands language; program validates execution data.
+    items = items.map(validatePlanTimes).filter(Boolean);
+
     if (items.length) {
       await setPendingPlan(env.DB, uid, { plan_items: items });
-      return withPlanActions(`${result.reply || "我整理好了。"}\n\n📅 建議安排（尚未儲存）：\n${formatPlan(items)}\n\n選一下👇`);
+      const heading = result.intent === "create_reminder" ? "⏰ 我理解成這樣：" : "📅 我整理成這樣：";
+      return withPlanActions(`${result.reply || heading}\n\n${formatPlan(items)}\n\n選一下👇`);
     }
   }
 
-  return result.reply || "請把待辦、期限或你想安排的事情告訴我。";
+  return result.reply || "我有收到，但目前還不能安全判斷你想執行哪個操作。";
+}
+
+function normalizeTaskIds(taskIds, taskId) {
+  const raw = Array.isArray(taskIds) ? taskIds : (taskId !== null && taskId !== undefined ? [taskId] : []);
+  return [...new Set(raw.map(Number).filter(Number.isInteger))].slice(0, 50);
+}
+
+function validatePlanTimes(item) {
+  if (!item) return null;
+  const now = Date.now();
+
+  for (const key of ["start_time","due_time","remind_at"]) {
+    if (!item[key]) continue;
+    const t = new Date(item[key]).getTime();
+    if (!Number.isFinite(t)) item[key] = null;
+  }
+
+  // Reminders must never be silently scheduled in the past.
+  if (item.remind_at && new Date(item.remind_at).getTime() <= now) {
+    item.remind_at = null;
+  }
+
+  // Due time should not precede start time.
+  if (item.start_time && item.due_time) {
+    const s = new Date(item.start_time).getTime();
+    const d = new Date(item.due_time).getTime();
+    if (d < s) item.start_time = null;
+  }
+
+  return item;
 }
 
 
@@ -1160,6 +1172,24 @@ function buildCompletionMessage(task, env) {
   return {
     text: `做完啦！🐽✨\n${task.title}\n這項我幫你收掉了。`,
     rewardImageUrl: `${base}/reward-images/${index}.jpg`
+  };
+}
+
+function withDeleteActions(text) {
+  return {
+    text,
+    quickReply: {
+      items: [
+        {
+          type: "action",
+          action: { type: "message", label: "確定刪除🗑️", text: "好呀🐽" }
+        },
+        {
+          type: "action",
+          action: { type: "message", label: "先不要🙈", text: "先不要🙈" }
+        }
+      ]
+    }
   };
 }
 
