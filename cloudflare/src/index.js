@@ -296,7 +296,7 @@ async function handleTaskMessage(uid, text, env) {
   const result = await interpretStructured(text, context, env);
 
   if (result.intent === "list_tasks") {
-    return taskHubMessage();
+    return buildTaskHubMessage();
   }
 
   if (result.intent === "complete_task") {
@@ -1157,7 +1157,7 @@ ${context || "目前沒有"}
 12. delete_all_tasks 只代表使用者要移除目前全部待辦，不要建立一個名為「刪除全部任務」的新任務。
 13. 使用者說「把 X 改成目標/日常/例行」等已儲存任務分類調整時，intent=change_task_type，從現有待辦選 task_id/task_ids，並填頂層 task_type。不要重新建立任務。
 14. 使用者是在要求提醒時，intent 使用 create_reminder，並在 plan_items 中輸出真正的任務名稱與 remind_at。title 只寫行動本身，例如「去洗澡」，不要寫「提醒我去洗澡」。提醒型任務的 start_time、due_time、estimated_minutes 一律設 null。
-14. 時間解析一律以 Asia/Taipei 為準。相對時間（例如「兩分鐘後」「半小時後」「三天後」）必須以現在台灣時間精確相加。
+15. 時間解析一律以 Asia/Taipei 為準.相對時間（例如「兩分鐘後」「半小時後」「三天後」）必須以現在台灣時間精確相加。
 15. 若使用者只是說「完成」「好了」「做完了」，優先參考現有任務與最近上下文判斷；若無法唯一判定，不要猜 task id。
 16. 若提醒時間是相對時間，例如「兩分鐘後」「半小時後」「1.5 小時後」「三天後」，你負責理解並填 time_semantics；不要自己做最終時間算術。kind=relative，amount 填數值（半小時 = 30 minute），unit 只能是 minute|hour|day|week。
 17. 若是絕對時間，例如「明早八點」「下週五下午三點」，kind=absolute，remind_at 仍輸出含 +08:00 的 ISO8601。
@@ -1167,11 +1167,6 @@ ${context || "目前沒有"}
 21. recurrence 格式：freq 只能 daily|weekly|monthly；weekdays 用 0=週日...6=週六；time 用 HH:MM；monthly 可用 day_of_month。
 22. 每個任務都要分類 task_type：routine=固定重複的例行任務/課表/固定習慣；goal=有成果、截止或需要多步驟推進的目標/報告/專案；daily=一次性的日常瑣事，例如洗衣、洗澡、拿包裹。
 23. 有 recurrence 的任務原則上 task_type=routine。
-22. 每個 plan_item 都要填 task_type，只能是 routine|goal|daily：
-- routine：固定週期、課表、每週/每天/每月重複的事情。
-- goal：有明確成果或期限的較大型任務，例如報告、考試準備、專案、申請。
-- daily：一次性的生活雜務與短待辦，例如洗衣服、拿包裹、打電話。
-有 recurrence 時原則上 task_type=routine。
 
 JSON schema：
 {
