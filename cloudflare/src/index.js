@@ -225,10 +225,10 @@ async function handleTaskMessage(uid, text, env) {
     return listTasksText(env.DB, uid);
   }
 
-  const relativeReminder = parseRelativeReminder(text);
-  if (relativeReminder) {
-    await setPendingPlan(env.DB, uid, { plan_items: [relativeReminder] });
-    return withPlanActions(`⏰ 好，我先幫你設好：${relativeReminder.title}\n提醒時間：${fmtTaipei(relativeReminder.remind_at)}\n\n目前還沒存，選一下👇`);
+  const deterministicReminder = parseDeterministicReminder(text);
+  if (deterministicReminder) {
+    await setPendingPlan(env.DB, uid, { plan_items: [deterministicReminder] });
+    return withPlanActions(`⏰ 好，我先幫你設好：${deterministicReminder.title}\n提醒時間：${fmtTaipei(deterministicReminder.remind_at)}\n\n目前還沒存，選一下👇`);
   }
 
 
@@ -264,6 +264,72 @@ async function handleTaskMessage(uid, text, env) {
   }
 
   return result.reply || "請把待辦、期限或你想安排的事情告訴我。";
+}
+
+function parseDeterministicReminder(text) {
+  return parseRelativeReminder(text) || parseAbsoluteReminder(text);
+}
+
+function parseAbsoluteReminder(text) {
+  const s = String(text || "").trim();
+
+  // Examples:
+  // 今天晚上10:50提醒我叫弟弟起床
+  // 明天下午3點提醒我交作業
+  // 今天 22:30 到時候提醒我洗衣服
+  const m = s.match(/^(今天|明天)?\s*(早上|上午|中午|下午|晚上)?\s*(\d{1,2})(?:[:：](\d{1,2})|點(?:\s*(\d{1,2})\s*分?)?)?\s*(?:到時候)?\s*提醒我\s*(.+)$/u);
+  if (!m) return null;
+
+  const dayWord = m[1] || "今天";
+  const part = m[2] || "";
+  let hour = Number(m[3]);
+  const minute = Number(m[4] ?? m[5] ?? 0);
+  const title = String(m[6] || "").trim().replace(/[。！!]+$/u, "");
+
+  if (!title || !Number.isFinite(hour) || !Number.isFinite(minute) || minute < 0 || minute > 59) return null;
+
+  if (part === "下午" || part === "晚上") {
+    if (hour < 12) hour += 12;
+  } else if (part === "中午") {
+    if (hour < 11) hour += 12;
+  } else if ((part === "早上" || part === "上午") && hour === 12) {
+    hour = 0;
+  }
+  if (hour < 0 || hour > 23) return null;
+
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Taipei",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(now);
+  const get = type => Number(parts.find(p => p.type === type)?.value);
+  let y = get("year"), mo = get("month"), d = get("day");
+
+  // Build target using Taipei wall-clock -> UTC by using +08:00 explicitly.
+  const base = new Date(`${y}-${String(mo).padStart(2,"0")}-${String(d).padStart(2,"0")}T00:00:00+08:00`);
+  if (dayWord === "明天") base.setUTCDate(base.getUTCDate() + 1);
+
+  const targetDate = new Date(base.getTime());
+  // base above is midnight Taipei = previous day 16:00Z; adding local hour/minute is safe.
+  targetDate.setTime(base.getTime() + hour * 3600000 + minute * 60000);
+
+  // If user said "今天" and target already passed, reject instead of silently scheduling past.
+  if (dayWord === "今天" && targetDate.getTime() <= now.getTime()) return null;
+
+  const when = targetDate.toISOString();
+  return {
+    title: title.slice(0, 200),
+    description: `指定時間提醒：${dayWord}${part}${String(hour).padStart(2,"0")}:${String(minute).padStart(2,"0")}`,
+    first_step: title.slice(0, 500),
+    priority: 1,
+    start_time: when,
+    due_time: when,
+    remind_at: when,
+    estimated_minutes: null,
+    reason: "依照使用者指定的絕對時間由程式精準計算，不交由 AI 推算。"
+  };
 }
 
 function parseRelativeReminder(text) {
