@@ -289,11 +289,11 @@ async function callGemini(prompt, env, jsonMode) {
   for (const model of models) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 12000);
+      const timeout = setTimeout(() => controller.abort(), 8000);
 
       const generationConfig = {
         temperature: 0.2,
-        maxOutputTokens: jsonMode ? 2200 : 1200
+        maxOutputTokens: jsonMode ? 1200 : 900
       };
       if (jsonMode) generationConfig.responseMimeType = "application/json";
 
