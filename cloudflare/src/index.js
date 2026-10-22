@@ -252,10 +252,10 @@ async function handleTaskMessage(uid, text, env) {
     return listTasksText(env.DB, uid);
   }
 
-  const deterministicReminder = parseDeterministicReminder(text);
-  if (deterministicReminder) {
-    await setPendingPlan(env.DB, uid, { plan_items: [deterministicReminder] });
-    return withPlanActions(`⏰ 好，我先幫你設好：${deterministicReminder.title}\n提醒時間：${fmtTaipei(deterministicReminder.remind_at)}\n\n目前還沒存，選一下👇`);
+  const smartReminder = await resolveReminderIntent(text, env);
+  if (smartReminder) {
+    await setPendingPlan(env.DB, uid, { plan_items: [smartReminder] });
+    return withPlanActions(`⏰ 好，我先幫你設好：${smartReminder.title}\n提醒時間：${fmtTaipei(smartReminder.remind_at)}\n\n目前還沒存，選一下👇`);
   }
 
 
@@ -310,6 +310,202 @@ async function handleTaskMessage(uid, text, env) {
   }
 
   return result.reply || "請把待辦、期限或你想安排的事情告訴我。";
+}
+
+
+async function resolveReminderIntent(text, env) {
+  const source = String(text || "").trim();
+  if (!/(提醒|叫我|通知我|記得叫我|到時候)/u.test(source)) return null;
+
+  // 1) Exact relative anchors from the user's own words are authoritative.
+  const anchored = parseFlexibleRelativeReminder(source);
+  if (anchored) return anchored;
+
+  // 2) Keep fast deterministic parsing for very explicit absolute phrases.
+  const deterministic = parseDeterministicReminder(source);
+  if (deterministic) return deterministic;
+
+  // 3) Let Gemini understand natural time language, then validate the result.
+  const now = new Date();
+  const taipeiNow = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Taipei",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(now);
+  const weekday = new Intl.DateTimeFormat("zh-TW", {
+    timeZone: "Asia/Taipei",
+    weekday: "long"
+  }).format(now);
+
+  const prompt = `你是一個只負責解析提醒時間的繁體中文時間理解器。
+現在台灣時間：${taipeiNow}（${weekday}）
+時區固定：Asia/Taipei。
+
+請理解使用者自然語言中的提醒意圖，例如：
+「明早八點叫我起床」
+「下週五下午提醒我交報告」
+「月底前提醒我繳房租」
+「今晚睡前提醒我吃藥」
+「晚一點提醒我回電話」
+
+只輸出 JSON：
+{
+  "is_reminder": true,
+  "title": "真正要做的事情",
+  "remind_at": "ISO8601（必須含 +08:00）或 null",
+  "time_is_ambiguous": false,
+  "ambiguity_reason": ""
+}
+
+規則：
+1. 不可輸出過去時間。
+2. 明確日期、星期、時段依台灣時間解讀。
+3. 「下午3點」= 15:00；「晚上8點」= 20:00。
+4. 「三點半」= xx:30。
+5. 若只有模糊時段：早上 09:00、下午 15:00、晚上 19:00、睡前 23:00。
+6. 「晚一點」預設現在 + 2 小時。
+7. 「月底前」若沒有更精確時間，設為本月底 20:00。
+8. 無法合理判定才將 remind_at 設 null，絕對不要亂填。
+9. title 只保留任務本身，不要包含「提醒我」。
+
+使用者：${source}`;
+
+  let raw;
+  try {
+    raw = await callGemini(prompt, env, true);
+  } catch (err) {
+    console.error("Reminder semantic parser failed", {
+      name: err?.name || null,
+      message: err?.message || String(err)
+    });
+    return null;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(stripFence(raw));
+  } catch {
+    return null;
+  }
+
+  if (!parsed?.is_reminder || !parsed?.title || !parsed?.remind_at) return null;
+
+  const when = new Date(parsed.remind_at);
+  if (Number.isNaN(when.getTime())) return null;
+
+  // Safety margin: reject AI outputs that land in the past or essentially "now".
+  if (when.getTime() <= Date.now() + 15000) {
+    console.warn("Rejected invalid reminder time from Gemini", {
+      remind_at: parsed.remind_at,
+      source_length: source.length
+    });
+    return null;
+  }
+
+  return {
+    title: String(parsed.title).trim().slice(0, 200),
+    description: parsed.time_is_ambiguous
+      ? `自然語言提醒（採預設時間）：${String(parsed.ambiguity_reason || "").slice(0, 300)}`
+      : "自然語言提醒時間已解析並通過台灣時區驗證",
+    first_step: String(parsed.title).trim().slice(0, 500),
+    priority: 1,
+    start_time: when.toISOString(),
+    due_time: when.toISOString(),
+    remind_at: when.toISOString(),
+    estimated_minutes: null,
+    reason: parsed.time_is_ambiguous
+      ? "時間描述較模糊，使用預設時段並在儲存前讓使用者確認。"
+      : "由 AI 理解自然時間語意，程式驗證時區與時間有效性。"
+  };
+}
+
+function parseFlexibleRelativeReminder(text) {
+  const s = String(text || "").trim();
+
+  // 半小時後
+  const half = s.match(/半\s*(小時|鐘頭)後(?:到時候)?\s*(?:提醒我|叫我|通知我)\s*(.+)$/u);
+  if (half) return buildRelativeReminder(30, "分鐘", half[2], "半小時後");
+
+  // Supports Arabic or common Chinese numbers and minutes/hours/days/weeks.
+  const m = s.match(/(\d+(?:\.\d+)?|[零〇一二兩三四五六七八九十百]+)\s*(分鐘|分|小時|鐘頭|天|日|週|星期)後(?:到時候)?\s*(?:提醒我|叫我|通知我)\s*(.+)$/u);
+  if (!m) return null;
+
+  const amount = parseNaturalNumber(m[1]);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+
+  const unit = m[2];
+  const title = String(m[3] || "").trim().replace(/[。！!]+$/u, "");
+  if (!title) return null;
+
+  let ms;
+  if (unit === "分鐘" || unit === "分") ms = amount * 60 * 1000;
+  else if (unit === "小時" || unit === "鐘頭") ms = amount * 60 * 60 * 1000;
+  else if (unit === "天" || unit === "日") ms = amount * 24 * 60 * 60 * 1000;
+  else ms = amount * 7 * 24 * 60 * 60 * 1000;
+
+  const when = new Date(Date.now() + ms).toISOString();
+  return {
+    title: title.slice(0, 200),
+    description: `相對時間提醒：${m[1]}${unit}後`,
+    first_step: title.slice(0, 500),
+    priority: 1,
+    start_time: when,
+    due_time: when,
+    remind_at: when,
+    estimated_minutes: null,
+    reason: "直接依使用者原句中的相對時間計算，不交由 AI 猜測。"
+  };
+}
+
+function parseNaturalNumber(input) {
+  const s = String(input || "").trim();
+  if (/^\d+(?:\.\d+)?$/.test(s)) return Number(s);
+
+  const digits = { "零":0, "〇":0, "一":1, "二":2, "兩":2, "三":3, "四":4, "五":5, "六":6, "七":7, "八":8, "九":9 };
+  if (s === "十") return 10;
+  if (s === "百") return 100;
+
+  let total = 0;
+  let current = 0;
+  for (const ch of s) {
+    if (ch in digits) {
+      current = digits[ch];
+    } else if (ch === "十") {
+      total += (current || 1) * 10;
+      current = 0;
+    } else if (ch === "百") {
+      total += (current || 1) * 100;
+      current = 0;
+    } else {
+      return NaN;
+    }
+  }
+  return total + current;
+}
+
+function buildRelativeReminder(amount, unit, rawTitle, rawTimeText) {
+  const title = String(rawTitle || "").trim().replace(/[。！!]+$/u, "");
+  if (!title) return null;
+  const ms = unit === "分鐘"
+    ? amount * 60 * 1000
+    : amount * 60 * 60 * 1000;
+  const when = new Date(Date.now() + ms).toISOString();
+  return {
+    title: title.slice(0, 200),
+    description: `相對時間提醒：${rawTimeText}`,
+    first_step: title.slice(0, 500),
+    priority: 1,
+    start_time: when,
+    due_time: when,
+    remind_at: when,
+    estimated_minutes: null,
+    reason: "直接依使用者原句中的相對時間計算，不交由 AI 猜測。"
+  };
 }
 
 function parseDeterministicReminder(text) {
