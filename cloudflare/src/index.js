@@ -90,7 +90,11 @@ async function processLineEvents(events, env) {
         : await interpretPlainText(text, env);
       console.log("AI/task reply ready", { length: reply.length });
     } catch (err) {
-      console.error("Message processing failed", err);
+      console.error("Message processing failed", {
+        name: err?.name || null,
+        message: err?.message || String(err),
+        stack: err?.stack || null
+      });
       reply = "這次處理失敗，但 LINE 連線正常。請稍後再傳一次。";
     }
 
@@ -375,6 +379,11 @@ async function callGemini(prompt, env, jsonMode) {
 
       if (!res.ok) {
         const detail = await res.text();
+        console.error("Gemini HTTP error", {
+          model,
+          status: res.status,
+          detail: detail.slice(0, 500)
+        });
         lastError = new Error(`${model} -> ${res.status}: ${detail.slice(0, 300)}`);
         if ([429, 500, 502, 503, 504].includes(res.status)) continue;
         throw lastError;
@@ -394,10 +403,19 @@ async function callGemini(prompt, env, jsonMode) {
       return text.slice(0, 9000);
     } catch (err) {
       lastError = err;
-      console.error("Gemini model failed", model, String(err));
+      console.error("Gemini model failed", {
+        model,
+        name: err?.name || null,
+        message: err?.message || String(err),
+        stack: err?.stack || null
+      });
     }
   }
 
+  console.error("All Gemini models failed", {
+    name: lastError?.name || null,
+    message: lastError?.message || String(lastError || "unknown")
+  });
   throw lastError || new Error("all Gemini models failed");
 }
 
