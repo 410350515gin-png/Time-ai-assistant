@@ -8,6 +8,10 @@ export default {
       return json({ status: "ok", runtime: "cloudflare-workers", version: "0.1" });
     }
 
+    if (request.method === "GET" && url.pathname === "/diag") {
+      return runDiagnostics(env);
+    }
+
     if (request.method === "POST" && (url.pathname === "/callback" || url.pathname === "/webhook")) {
       return handleLineWebhook(request, env);
     }
@@ -184,4 +188,64 @@ function timingSafeEqual(a, b) {
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: JSON_HEADERS });
+}
+
+
+async function runDiagnostics(env) {
+  const result = {
+    runtime: "cloudflare-workers",
+    secrets: {
+      GEMINI_API_KEY: Boolean(env.GEMINI_API_KEY),
+      CHANNEL_SECRET: Boolean(env.CHANNEL_SECRET),
+      CHANNEL_ACCESS_TOKEN: Boolean(env.CHANNEL_ACCESS_TOKEN)
+    },
+    gemini: { ok: false, model: null, status: null },
+    line: { ok: false, status: null }
+  };
+
+  const models = String(env.GEMINI_MODELS || "gemini-3.8-flash")
+    .split(",")
+    .map(x => x.trim())
+    .filter(Boolean);
+
+  for (const model of models.slice(0, 2)) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY || "")}`,
+        {
+          method: "POST",
+          headers: JSON_HEADERS,
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: "Reply with exactly OK" }] }],
+            generationConfig: { maxOutputTokens: 8, temperature: 0 }
+          }),
+          signal: controller.signal
+        }
+      );
+      clearTimeout(timeout);
+      result.gemini.status = res.status;
+      result.gemini.model = model;
+      if (res.ok) {
+        result.gemini.ok = true;
+        break;
+      }
+    } catch (err) {
+      result.gemini.status = String(err?.name || err);
+      result.gemini.model = model;
+    }
+  }
+
+  try {
+    const res = await fetch("https://api.line.me/v2/bot/info", {
+      headers: { authorization: `Bearer ${env.CHANNEL_ACCESS_TOKEN || ""}` }
+    });
+    result.line.status = res.status;
+    result.line.ok = res.ok;
+  } catch (err) {
+    result.line.status = String(err?.name || err);
+  }
+
+  return json(result);
 }
