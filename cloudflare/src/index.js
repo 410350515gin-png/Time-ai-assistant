@@ -25,6 +25,10 @@ export default {
       return runReminderDiagnostics(env);
     }
 
+    if (request.method === "POST" && url.pathname === "/admin/setup-rich-menu") {
+      return setupRichMenu(env);
+    }
+
     const rewardMatch = url.pathname.match(/^\/reward-images\/(\d+)\.jpg$/);
     if (request.method === "GET" && rewardMatch) {
       const index = Number(rewardMatch[1]) - 1;
@@ -142,6 +146,7 @@ async function processQueuedLineEvent(event, env) {
     await ensureSchema(env.DB);
     await ensureReminderColumn(env.DB);
     await ensureRecurrenceColumn(env.DB);
+    await ensureTaskTypeColumn(env.DB);
   }
 
   console.log("Queue LINE text event", {
@@ -363,8 +368,13 @@ async function handleTaskMessage(uid, text, env) {
 async function handleFastPath(uid, text, env) {
   const s = String(text || "").trim();
 
-  if (s === "系統：列出任務") {
-    return listTasksText(env.DB, uid);
+  if (s === "系統：列出任務" || s === "查看所有任務") {
+    return buildTaskHubMessage();
+  }
+
+  const categoryMatch = s.match(/^系統：任務分類:(routine|goal|daily)$/u);
+  if (categoryMatch) {
+    return listTasksByType(env.DB, uid, categoryMatch[1]);
   }
 
   const done = s.match(/^系統：完成任務:(\d+)$/u);
@@ -408,6 +418,117 @@ async function handleFastPath(uid, text, env) {
   }
 
   return null;
+}
+
+function buildTaskHubMessage() {
+  return {
+    text: "任務中心來啦🐽✨\n想看哪一區？",
+    flex: {
+      type: "bubble",
+      body: {
+        type: "box",
+        layout: "vertical",
+        spacing: "md",
+        contents: [
+          { type: "text", text: "🐽 任務中心", weight: "bold", size: "xl" },
+          { type: "text", text: "我幫你分成三區，找起來比較快～", wrap: true, size: "sm" },
+          {
+            type: "button",
+            style: "primary",
+            action: { type: "message", label: "🔁 例行性任務", text: "系統：任務分類:routine" }
+          },
+          {
+            type: "button",
+            action: { type: "message", label: "🎯 目標任務", text: "系統：任務分類:goal" }
+          },
+          {
+            type: "button",
+            action: { type: "message", label: "🧺 日常任務", text: "系統：任務分類:daily" }
+          }
+        ]
+      }
+    }
+  };
+}
+
+async function listTasksByType(db, uid, type) {
+  const meta = {
+    routine: { title: "🔁 例行性任務", empty: "目前沒有固定例行任務喔🐽" },
+    goal: { title: "🎯 目標任務", empty: "目前沒有目標任務喔🐽" },
+    daily: { title: "🧺 日常任務", empty: "目前沒有日常任務喔🐽" }
+  }[type];
+
+  const r = await db.prepare(
+    "SELECT id,title,due_time,remind_at,recurrence_json FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') AND task_type=? ORDER BY COALESCE(due_time,remind_at,'9999-12-31'), priority ASC LIMIT 12"
+  ).bind(uid, type).all();
+
+  const rows = r.results || [];
+  if (!rows.length) {
+    return {
+      text: meta.empty,
+      quickReply: {
+        items: [{
+          type: "action",
+          action: { type: "message", label: "← 回任務中心", text: "查看所有任務" }
+        }]
+      }
+    };
+  }
+
+  const contents = [
+    { type: "text", text: meta.title, weight: "bold", size: "xl" },
+    { type: "separator", margin: "md" }
+  ];
+
+  for (const t of rows.slice(0, 6)) {
+    const when = t.remind_at || t.due_time;
+    const recur = parseRecurrenceJson(t.recurrence_json);
+    const detail = recur
+      ? formatRecurrence(recur)
+      : (when ? fmtTaipei(when) : "尚未排時間");
+
+    contents.push({
+      type: "box",
+      layout: "vertical",
+      margin: "md",
+      spacing: "sm",
+      contents: [
+        { type: "text", text: String(t.title || "").slice(0, 40), weight: "bold", wrap: true },
+        { type: "text", text: detail, size: "sm", color: "#777777", wrap: true },
+        {
+          type: "box",
+          layout: "horizontal",
+          spacing: "sm",
+          contents: [
+            {
+              type: "button",
+              height: "sm",
+              action: { type: "message", label: "完成✅", text: `系統：完成任務:${t.id}` }
+            },
+            {
+              type: "button",
+              height: "sm",
+              action: { type: "message", label: "刪除🗑️", text: `系統：刪除任務:${t.id}` }
+            }
+          ]
+        }
+      ]
+    });
+  }
+
+  return {
+    text: meta.title,
+    flex: {
+      type: "bubble",
+      body: { type: "box", layout: "vertical", spacing: "md", contents }
+    },
+    quickReply: {
+      items: [{
+        type: "action",
+        action: { type: "message", label: "← 回任務中心", text: "查看所有任務" }
+      }]
+    }
+  };
 }
 
 function normalizeTaskIds(taskIds, taskId) {
@@ -819,6 +940,9 @@ function sanitizePlanItems(items) {
         ? Math.max(1, Math.round(Number(x.estimated_minutes)))
         : null,
       recurrence: sanitizeRecurrence(x.recurrence),
+      task_type: ["routine","goal","daily"].includes(String(x.task_type || "").toLowerCase())
+        ? String(x.task_type).toLowerCase()
+        : (x.recurrence ? "routine" : "daily"),
       reason: x.reason ? String(x.reason).slice(0, 500) : ""
     }));
 }
@@ -948,6 +1072,11 @@ ${context || "目前沒有"}
 19. 使用者描述固定課表、每週、每天、每月、固定週期時，可以在 plan_items.recurrence 填週期設定；不要把未來每一次全部展開成很多筆任務。
 20. 使用者一次給多項行程時，你仍要先幫他比較衝突、優先順序、空檔與負荷，必要時提出較合理的時間安排；除非使用者明確要求立即建立，否則先提出完整方案讓他確認。
 21. recurrence 格式：freq 只能 daily|weekly|monthly；weekdays 用 0=週日...6=週六；time 用 HH:MM；monthly 可用 day_of_month。
+22. 每個 plan_item 都要填 task_type，只能是 routine|goal|daily：
+- routine：固定週期、課表、每週/每天/每月重複的事情。
+- goal：有明確成果或期限的較大型任務，例如報告、考試準備、專案、申請。
+- daily：一次性的生活雜務與短待辦，例如洗衣服、拿包裹、打電話。
+有 recurrence 時原則上 task_type=routine。
 
 JSON schema：
 {
@@ -970,6 +1099,7 @@ JSON schema：
       "due_time": "ISO8601 或 null",
       "remind_at": "ISO8601 或 null",
       "estimated_minutes": 60,
+      "task_type": "routine|goal|daily",
       "recurrence": {
         "freq": "weekly",
         "interval": 1,
@@ -1297,6 +1427,7 @@ async function ensureSchema(db) {
       remind_at TEXT,
       estimated_minutes INTEGER,
       recurrence_json TEXT,
+      task_type TEXT NOT NULL DEFAULT 'daily',
       status TEXT NOT NULL DEFAULT 'pending',
       reminder_sent_at TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -1348,12 +1479,13 @@ async function savePlanTasks(db, uid, items) {
   if (!clean.length) return 0;
   const stmts = clean.map(x => db.prepare(
     `INSERT INTO tasks(
-      line_user_id,title,description,first_step,priority,start_time,due_time,remind_at,estimated_minutes,recurrence_json,status
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,'pending')`
+      line_user_id,title,description,first_step,priority,start_time,due_time,remind_at,estimated_minutes,recurrence_json,task_type,status
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending')`
   ).bind(
     uid, x.title, x.description, x.first_step, x.priority,
     x.start_time, x.due_time, x.remind_at, x.estimated_minutes,
-    x.recurrence ? JSON.stringify(x.recurrence) : null
+    x.recurrence ? JSON.stringify(x.recurrence) : null,
+    x.task_type
   ));
   const results = await db.batch(stmts);
   return results.reduce((n, r) => n + Number(r?.meta?.changes || 0), 0);
@@ -1361,10 +1493,10 @@ async function savePlanTasks(db, uid, items) {
 
 async function activeTasksContext(db, uid) {
   const r = await db.prepare(
-    "SELECT id,title,status,start_time,due_time,first_step FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') ORDER BY COALESCE(due_time,'9999-12-31'), priority ASC LIMIT 40"
+    "SELECT id,title,status,start_time,due_time,first_step,task_type FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') ORDER BY COALESCE(due_time,'9999-12-31'), priority ASC LIMIT 40"
   ).bind(uid).all();
   return (r.results || []).map(t =>
-    `id=${t.id};title=${t.title};status=${t.status};start=${t.start_time || ""};due=${t.due_time || ""};first_step=${t.first_step || ""}`
+    `id=${t.id};title=${t.title};type=${t.task_type || "daily"};status=${t.status};start=${t.start_time || ""};due=${t.due_time || ""};first_step=${t.first_step || ""}`
   ).join("\n");
 }
 
@@ -1480,6 +1612,15 @@ async function ensureReminderColumn(db) {
 async function ensureRecurrenceColumn(db) {
   try {
     await db.prepare("ALTER TABLE tasks ADD COLUMN recurrence_json TEXT").run();
+  } catch (err) {
+    const msg = String(err?.message || err);
+    if (!/duplicate column name/i.test(msg)) throw err;
+  }
+}
+
+async function ensureTaskTypeColumn(db) {
+  try {
+    await db.prepare("ALTER TABLE tasks ADD COLUMN task_type TEXT NOT NULL DEFAULT 'daily'").run();
   } catch (err) {
     const msg = String(err?.message || err);
     if (!/duplicate column name/i.test(msg)) throw err;
@@ -1667,7 +1808,19 @@ function toLineTextMessage(message) {
 }
 
 function toLineMessages(message) {
-  const messages = [toLineTextMessage(message)];
+  const messages = [];
+
+  if (message && typeof message === "object" && message.flex) {
+    messages.push({
+      type: "flex",
+      altText: String(message.text || "任務中心").slice(0, 400),
+      contents: message.flex,
+      ...(message.quickReply ? { quickReply: message.quickReply } : {})
+    });
+  } else {
+    messages.push(toLineTextMessage(message));
+  }
+
   if (message && typeof message === "object" && message.rewardImageUrl) {
     messages.push({
       type: "image",
@@ -1744,6 +1897,68 @@ function timingSafeEqual(a, b) {
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: JSON_HEADERS });
 }
+
+async function setupRichMenu(env) {
+  if (!env.CHANNEL_ACCESS_TOKEN) return json({ error: "missing LINE token" }, 500);
+
+  const create = await fetch("https://api.line.me/v2/bot/richmenu", {
+    method: "POST",
+    headers: {
+      ...JSON_HEADERS,
+      authorization: `Bearer ${env.CHANNEL_ACCESS_TOKEN}`
+    },
+    body: JSON.stringify({
+      size: { width: 2500, height: 843 },
+      selected: true,
+      name: "Pig Secretary Main Menu",
+      chatBarText: "🐽 任務選單",
+      areas: [
+        {
+          bounds: { x: 0, y: 0, width: 2500, height: 843 },
+          action: { type: "message", text: "查看所有任務" }
+        }
+      ]
+    })
+  });
+
+  if (!create.ok) {
+    const detail = await create.text();
+    return json({ error: "rich menu create failed", detail: detail.slice(0, 500) }, create.status);
+  }
+
+  const data = await create.json();
+  const richMenuId = data.richMenuId;
+
+  // A simple embedded PNG is used as the tappable persistent menu image.
+  const png = Uint8Array.from(atob(RICH_MENU_PNG_BASE64), c => c.charCodeAt(0));
+  const upload = await fetch(`https://api-data.line.me/v2/bot/richmenu/${richMenuId}/content`, {
+    method: "POST",
+    headers: {
+      "content-type": "image/png",
+      authorization: `Bearer ${env.CHANNEL_ACCESS_TOKEN}`
+    },
+    body: png
+  });
+
+  if (!upload.ok) {
+    const detail = await upload.text();
+    return json({ error: "rich menu image upload failed", richMenuId, detail: detail.slice(0, 500) }, upload.status);
+  }
+
+  const setDefault = await fetch(`https://api.line.me/v2/bot/user/all/richmenu/${richMenuId}`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${env.CHANNEL_ACCESS_TOKEN}` }
+  });
+
+  if (!setDefault.ok) {
+    const detail = await setDefault.text();
+    return json({ error: "set default rich menu failed", richMenuId, detail: detail.slice(0, 500) }, setDefault.status);
+  }
+
+  return json({ ok: true, richMenuId });
+}
+
+const RICH_MENU_PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAA+gAAADSCAYAAADr0j6QAAAACXBIWXMAAAsSAAALEgHS3X78AAABF0lEQVR4nO3BMQEAAADCoPVPbQhPoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgJ8B0AABkFfXWQAAAABJRU5ErkJggg==";
 
 async function runReminderDiagnostics(env) {
   const result = {
