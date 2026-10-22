@@ -17,3 +17,7 @@ database_id = "db4d34c0-2747-4077-a560-20b89e8aa2cd"
 enabled = true
 invocation_logs = true
 persist = true
+
+
+[triggers]
+crons = ["* * * * *"]
