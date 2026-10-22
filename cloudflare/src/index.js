@@ -147,6 +147,7 @@ async function processQueuedLineEvent(event, env) {
     await ensureReminderColumn(env.DB);
     await ensureRecurrenceColumn(env.DB);
     await ensureTaskTypeColumn(env.DB);
+    await ensureTaskTypeColumn(env.DB);
   }
 
   console.log("Queue LINE text event", {
@@ -292,7 +293,7 @@ async function handleTaskMessage(uid, text, env) {
   const result = await interpretStructured(text, context, env);
 
   if (result.intent === "list_tasks") {
-    return listTasksText(env.DB, uid);
+    return taskHubMessage();
   }
 
   if (result.intent === "complete_task") {
@@ -1072,6 +1073,8 @@ ${context || "目前沒有"}
 19. 使用者描述固定課表、每週、每天、每月、固定週期時，可以在 plan_items.recurrence 填週期設定；不要把未來每一次全部展開成很多筆任務。
 20. 使用者一次給多項行程時，你仍要先幫他比較衝突、優先順序、空檔與負荷，必要時提出較合理的時間安排；除非使用者明確要求立即建立，否則先提出完整方案讓他確認。
 21. recurrence 格式：freq 只能 daily|weekly|monthly；weekdays 用 0=週日...6=週六；time 用 HH:MM；monthly 可用 day_of_month。
+22. 每個任務都要分類 task_type：routine=固定重複的例行任務/課表/固定習慣；goal=有成果、截止或需要多步驟推進的目標/報告/專案；daily=一次性的日常瑣事，例如洗衣、洗澡、拿包裹。
+23. 有 recurrence 的任務原則上 task_type=routine。
 22. 每個 plan_item 都要填 task_type，只能是 routine|goal|daily：
 - routine：固定週期、課表、每週/每天/每月重複的事情。
 - goal：有明確成果或期限的較大型任務，例如報告、考試準備、專案、申請。
@@ -1099,6 +1102,7 @@ JSON schema：
       "due_time": "ISO8601 或 null",
       "remind_at": "ISO8601 或 null",
       "estimated_minutes": 60,
+      "task_type": "routine|goal|daily",
       "task_type": "routine|goal|daily",
       "recurrence": {
         "freq": "weekly",
@@ -1500,13 +1504,33 @@ async function activeTasksContext(db, uid) {
   ).join("\n");
 }
 
-async function listTasksText(db, uid) {
-  const r = await db.prepare(
-    "SELECT id,title,status,due_time,remind_at FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') ORDER BY COALESCE(due_time,remind_at,'9999-12-31'), priority ASC LIMIT 20"
-  ).bind(uid).all();
+function taskHubMessage() {
+  return {
+    text: "想看哪一區呀？🐽✨",
+    quickReply: {
+      items: [
+        { type: "action", action: { type: "message", label: "🔁 例行任務", text: "系統：任務分類:routine" } },
+        { type: "action", action: { type: "message", label: "🎯 目標任務", text: "系統：任務分類:goal" } },
+        { type: "action", action: { type: "message", label: "🧺 日常任務", text: "系統：任務分類:daily" } }
+      ]
+    }
+  };
+}
 
-  const rows = r.results || [];
-  if (!rows.length) return "現在沒有待辦啦🐽✨";
+async function listTasksText(db, uid, taskType = null) {
+  const r = await db.prepare(
+    taskType
+      ? "SELECT id,title,status,due_time,remind_at FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') AND task_type=? ORDER BY COALESCE(due_time,remind_at,'9999-12-31'), priority ASC LIMIT 20"
+      : "SELECT id,title,status,due_time,remind_at FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') ORDER BY COALESCE(due_time,remind_at,'9999-12-31'), priority ASC LIMIT 20"
+  );
+  const query = taskType ? r.bind(uid, taskType) : r.bind(uid);
+  const result = await query.all();
+
+  const rows = result.results || [];
+  if (!rows.length) {
+    const names = { routine: "例行任務", goal: "目標任務", daily: "日常任務" };
+    return taskType ? `${names[taskType]}目前空空的🐽✨` : "現在沒有待辦啦🐽✨";
+  }
 
   const now = Date.now();
   const todayKey = new Intl.DateTimeFormat("en-CA", {
@@ -1594,8 +1618,9 @@ async function listTasksText(db, uid) {
     });
   }
 
+  const categoryNames = { routine: "🔁 例行任務", goal: "🎯 目標任務", daily: "🧺 日常任務" };
   return {
-    text: "這些還在等你喔🐽\n\n" + sections.join("\n\n"),
+    text: (taskType ? categoryNames[taskType] : "這些還在等你喔🐽") + "\n\n" + sections.join("\n\n"),
     quickReply: { items: quickItems.slice(0, 13) }
   };
 }
