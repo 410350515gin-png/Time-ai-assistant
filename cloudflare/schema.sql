@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS users (
   line_user_id TEXT PRIMARY KEY,
   last_task_id INTEGER,
   last_task_at TEXT,
+  default_lead_minutes INTEGER,
+  last_prompt_json TEXT,
+  last_bot_text TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -47,6 +50,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   task_type TEXT NOT NULL DEFAULT 'daily',
   stuck_count INTEGER NOT NULL DEFAULT 0,
   last_barrier TEXT,
+  parent_id INTEGER,
+  step_index INTEGER,
+  session_at TEXT,
+  lead_minutes INTEGER,
   status TEXT NOT NULL DEFAULT 'pending',
   reminder_sent_at TEXT,
   reminder_claimed_at TEXT,
@@ -94,3 +101,4 @@ CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_time);
 CREATE INDEX IF NOT EXISTS idx_tasks_remind ON tasks(remind_at);
 CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_task_events_user_type ON task_events(line_user_id, event_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id, step_index);

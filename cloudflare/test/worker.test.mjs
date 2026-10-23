@@ -799,3 +799,339 @@ test("[PR2] 舊資料庫已是最新 schema 版本時，冷啟動只查 1 次", 
   await w2.fetch(new Request("https://w.test/diag/reminders", { headers: { authorization: "Bearer t" } }), { DB: db, ADMIN_TOKEN: "t" }, { waitUntil() {} });
   assert.equal(count, 1, `schema 檢查只應該查 1 次，實際 ${count}`);
 });
+
+/* ============================== PR #4：工作切分、工作前提醒、使用者控制權 ============================== */
+
+const REPORT = "星期天晚上 9 點要交心理實驗法報告，我現在還沒開始";
+const sundayAt = (hh, mm = 0) => {
+  // 下一個台灣時間的星期天
+  const l = new Date(Date.now() + 8 * HOUR);
+  const add = (7 - l.getUTCDay()) % 7 || 7;
+  return tpe(l.getUTCFullYear(), l.getUTCMonth() + 1, l.getUTCDate() + add, hh, mm);
+};
+const stepsProposal = (extra = {}) => ({
+  intent: "propose_steps", reply: "", planning_authorized: false,
+  goal: { title: "心理實驗法報告", due_time: sundayAt(21), due_source: "user" },
+  steps: [
+    { title: "確認有哪些報告要交、各自的要求", first_step: "打開課程網站看作業說明" },
+    { title: "決定先做哪一份" },
+    { title: "列報告架構" },
+    { title: "寫內容" },
+    { title: "檢查、交出" }
+  ],
+  ...extra
+});
+const pendingRow = h => JSON.parse(h.db.row("SELECT plan_json FROM pending_plans").plan_json);
+const quickData = h => h.net.lastMessage().quickReply.items.map(i => i.action.data);
+
+test("[PR4 P1] 只給截止資訊 → 只給步驟建議，不出現開始時間或時長", async () => {
+  const h = await setup();
+  h.net.gemini = () => stepsProposal();
+  const text = await h.say(REPORT);
+  assert.match(text, /心理實驗法報告/);
+  assert.match(text, /截止/);
+  assert.match(text, /① 確認有哪些報告要交/);
+  assert.doesNotMatch(text, /開始 \d|分鐘|\d+:\d+ 開始/, "不能替使用者定開始時間或時長");
+  const data = quickData(h);
+  assert.ok(data.some(d => d.startsWith("系統：確認方案:")));
+  assert.ok(data.some(d => d.startsWith("系統：只記目標:")));
+  assert.equal(h.db.row("SELECT COUNT(*) AS n FROM tasks").n, 0, "還沒確認就不會存");
+});
+
+test("[PR4 P1] AI 沒被授權卻排了開始時間與 120 分鐘 → 程式丟掉 AI 推算的欄位，只留使用者說的截止", async () => {
+  const h = await setup();
+  h.net.gemini = () => ({
+    intent: "propose_plan", reply: "", planning_authorized: false,
+    plan_items: [{
+      title: "心理實驗法報告", first_step: "打開文件", task_type: "goal", priority: 1,
+      start_time: tpe(2030, 1, 5, 10), estimated_minutes: 120, due_time: sundayAt(21),
+      sources: { start_time: "ai", estimated_minutes: "ai", due_time: "user" }
+    }]
+  });
+  const text = await h.say(REPORT);
+  assert.doesNotMatch(text, /開始/);
+  assert.doesNotMatch(text, /120 分鐘/);
+  assert.match(text, /截止/);
+  const item = pendingRow(h).plan_items[0];
+  assert.equal(item.start_time, null);
+  assert.equal(item.estimated_minutes, null);
+  assert.equal(item.priority, 3);
+  assert.ok(item.due_time);
+});
+
+test("[PR4 P1] 使用者明確說「幫我安排」→ 才保留 AI 建議的開始時間", async () => {
+  const h = await setup();
+  const start = new Date(Date.now() + 26 * HOUR).toISOString();
+  h.net.gemini = () => ({
+    intent: "propose_plan", reply: "", planning_authorized: true,
+    plan_items: [{ title: "洗衣服", first_step: "收髒衣服", start_time: start, estimated_minutes: 30, sources: { start_time: "ai" } }]
+  });
+  const text = await h.say("幫我安排明天洗衣服");
+  assert.match(text, /開始/);
+  assert.equal(pendingRow(h).plan_items[0].estimated_minutes, 30);
+});
+
+test("[PR4 P1] 截圖情境：bot 在聊天裡提議改成兩天、使用者回「好啊」→ 不能存舊方案，要出現修改版再確認", async () => {
+  const h = await setup();
+  // 1) 先有一份待確認方案
+  h.net.gemini = () => ({ intent: "propose_plan", reply: "", plan_items: [{ title: "心理實驗法報告", first_step: "打開文件" }] });
+  await h.say("幫我記心理實驗法報告");
+  const oldPlanId = pendingRow(h).id;
+  // 2) 使用者問問題，AI 用聊天回覆並提議修改（沒有產生新方案）
+  h.net.gemini = () => ({ intent: "chat", reply: "可以拆成兩天，要不要我幫你把進度調整一下？" });
+  await h.say("是否要分成兩天做");
+  // 3) 使用者回「好啊」
+  h.net.gemini = (t, prompt) => {
+    assert.match(prompt, /你（bot）上一句對使用者說：「可以拆成兩天/);
+    return { intent: "revise_plan", reply: "改成兩天囉", plan_items: [
+      { title: "心理實驗法報告：整理架構", first_step: "列大綱" },
+      { title: "心理實驗法報告：完成與檢查", first_step: "寫第一段" }
+    ] };
+  };
+  await h.webhook([h.textEvent("好啊")]);
+  assert.ok(h.queue.length >= 1, "「好啊」交給 AI，不是 Fast Path 直接存");
+  await h.drainQueue();
+  assert.equal(h.db.row("SELECT COUNT(*) AS n FROM tasks").n, 0, "不能存舊方案");
+  const plan = pendingRow(h);
+  assert.notEqual(plan.id, oldPlanId, "產生了新的方案");
+  assert.equal(plan.plan_items.length, 2);
+  assert.match(h.net.lastText(), /整理架構/);
+  // 4) 再按確認才寫入
+  await h.tap(h.net.lastMessage().quickReply.items[0].action.data);
+  assert.equal(h.db.row("SELECT COUNT(*) AS n FROM tasks").n, 2);
+});
+
+test("[PR4] bot 正在請你確認方案時，打字「好啊」仍然直接存檔（原本的功能不能壞）", async () => {
+  const h = await setup();
+  h.net.gemini = () => ({ intent: "propose_plan", reply: "", plan_items: [{ title: "倒垃圾", first_step: "綁袋子" }] });
+  await h.say("記一下倒垃圾");
+  const before = h.net.geminiCalls.length;
+  await h.webhook([h.textEvent("好啊")]);
+  await h.drainQueue();
+  assert.equal(h.net.geminiCalls.length, before, "不需要問 AI");
+  assert.equal(h.db.row("SELECT COUNT(*) AS n FROM tasks").n, 1);
+});
+
+test("[PR4] 確認步驟 → 存目標與步驟，問要一步一步還是一次排好", async () => {
+  const h = await setup();
+  h.net.gemini = () => stepsProposal();
+  await h.say(REPORT);
+  await h.tap(quickData(h)[0]);
+  const goal = h.db.row("SELECT * FROM tasks WHERE parent_id IS NULL");
+  assert.equal(goal.title, "心理實驗法報告");
+  assert.equal(goal.due_time, sundayAt(21));
+  assert.equal(goal.remind_at, null, "不會自動排提醒");
+  const steps = h.db.rows("SELECT title, step_index, session_at FROM tasks WHERE parent_id=? ORDER BY step_index", goal.id);
+  assert.equal(steps.length, 5);
+  assert.ok(steps.every(s => s.session_at === null), "步驟沒有時間");
+  assert.match(h.net.lastText(), /要怎麼排時間/);
+  assert.deepEqual(quickData(h), [`系統：排程方式:${goal.id}:step`, `系統：排程方式:${goal.id}:all`]);
+});
+
+test("[PR4] 打字修改步驟 → 顯示修改版、再確認", async () => {
+  const h = await setup();
+  h.net.gemini = () => stepsProposal();
+  await h.say(REPORT);
+  h.net.gemini = (t, prompt) => {
+    assert.match(prompt, /尚未確認的步驟建議/);
+    return stepsProposal({ steps: [{ title: "確認報告要求" }, { title: "寫完" }] });
+  };
+  const text = await h.say("步驟太多了，兩步就好");
+  assert.match(text, /改好了/);
+  assert.match(text, /② 寫完/);
+  assert.equal(h.db.row("SELECT COUNT(*) AS n FROM tasks").n, 0);
+});
+
+test("[PR4] 只記截止 → 只存目標，可以選截止前一天提醒", async () => {
+  const h = await setup();
+  h.net.gemini = () => stepsProposal({ goal: { title: "期末報告", due_time: new Date(Date.now() + 5 * 24 * HOUR).toISOString(), due_source: "user" } });
+  await h.say("下週要交期末報告");
+  const goalOnly = quickData(h).find(d => d.startsWith("系統：只記目標:"));
+  await h.tap(goalOnly);
+  assert.equal(h.db.row("SELECT COUNT(*) AS n FROM tasks").n, 1);
+  const id = h.db.row("SELECT id FROM tasks").id;
+  await h.tap(`系統：截止提醒:${id}`);
+  const t = h.db.row("SELECT remind_at, due_time FROM tasks WHERE id=?", id);
+  assert.equal(Date.parse(t.due_time) - Date.parse(t.remind_at), 24 * HOUR);
+});
+
+test("[PR4] AI 推測（不是使用者說的）截止時間不會存", async () => {
+  const h = await setup();
+  h.net.gemini = () => stepsProposal({ goal: { title: "報告", due_time: sundayAt(21), due_source: "ai" } });
+  const text = await h.say("我有一份報告要寫");
+  assert.doesNotMatch(text, /截止/);
+});
+
+async function setupGoal(h) {
+  h.net.gemini = () => stepsProposal();
+  await h.say(REPORT);
+  await h.tap(quickData(h)[0]);
+  const goal = h.db.row("SELECT id FROM tasks WHERE parent_id IS NULL").id;
+  const steps = h.db.rows("SELECT id FROM tasks WHERE parent_id=? ORDER BY step_index", goal).map(r => r.id);
+  return { goal, steps };
+}
+
+test("[PR4] 一步一步：選「30 分鐘後」→ 開始時間 +30 分、提醒提前 10 分鐘", async () => {
+  const h = await setup();
+  const { goal, steps } = await setupGoal(h);
+  await h.tap(`系統：排程方式:${goal}:step`);
+  assert.match(h.net.lastText(), /①「確認有哪些報告要交/);
+  assert.equal(pendingRow(h).action, "awaiting_step_time");
+  await h.tap(`系統：步驟時間:${steps[0]}:30m`);
+  const t = h.db.row("SELECT session_at, remind_at FROM tasks WHERE id=?", steps[0]);
+  assert.ok(Math.abs(Date.parse(t.session_at) - Date.now() - 30 * 60000) < 10000);
+  assert.equal(Date.parse(t.session_at) - Date.parse(t.remind_at), 10 * 60000);
+  assert.match(h.net.lastText(), /提前 10 分鐘/);
+  assert.equal(h.db.row("SELECT COUNT(*) AS n FROM pending_plans").n, 0);
+});
+
+test("[PR4] 一步一步：打字「今晚八點」→ AI 回 schedule_step，程式寫入時間", async () => {
+  const h = await setup();
+  const { goal, steps } = await setupGoal(h);
+  await h.tap(`系統：排程方式:${goal}:step`);
+  const at = new Date(Date.now() + 3 * HOUR).toISOString();
+  h.net.gemini = (t, prompt) => {
+    assert.match(prompt, /目前在等使用者回答/);
+    return { intent: "schedule_step", reply: "", task_ids: [steps[0]], session_at: at };
+  };
+  const text = await h.say("今晚八點");
+  assert.match(text, /排好了/);
+  assert.equal(h.db.row("SELECT session_at FROM tasks WHERE id=?", steps[0]).session_at, at);
+});
+
+test("[PR4] 改提醒提前時間 → 重新計算；設成預設後，下一步也套用", async () => {
+  const h = await setup();
+  const { steps } = await setupGoal(h);
+  await h.tap(`系統：步驟時間:${steps[0]}:tomorrow`);
+  await h.tap(`系統：設提前:${steps[0]}:30`);
+  let t = h.db.row("SELECT session_at, remind_at, lead_minutes FROM tasks WHERE id=?", steps[0]);
+  assert.equal(t.lead_minutes, 30);
+  assert.equal(Date.parse(t.session_at) - Date.parse(t.remind_at), 30 * 60000);
+  await h.tap("系統：預設提前:30");
+  await h.tap(`系統：步驟時間:${steps[1]}:tomorrow`);
+  t = h.db.row("SELECT session_at, remind_at FROM tasks WHERE id=?", steps[1]);
+  assert.equal(Date.parse(t.session_at) - Date.parse(t.remind_at), 30 * 60000);
+});
+
+test("[PR4] 工作前提醒：內容有目標、第幾步、開始時間；按鈕有開始、晚點、卡住、怎麼做", async () => {
+  const h = await setup();
+  const { steps } = await setupGoal(h);
+  const session = new Date(Date.now() + 10 * 60000).toISOString();
+  h.db.exec("UPDATE tasks SET session_at=?, remind_at=? WHERE id=?", session, new Date(Date.now() - 1000).toISOString(), steps[0]);
+  await h.cron();
+  const msg = h.net.pushes().at(-1).body.messages[0];
+  assert.match(msg.text, /10 分鐘後/);
+  assert.match(msg.text, /心理實驗法報告/);
+  assert.match(msg.text, /第 1\/5 步：確認有哪些報告要交/);
+  const labels = msg.quickReply.items.map(i => i.action.label);
+  assert.deepEqual(labels, ["▶️ 開始了", "⏰ 晚30分", "🧩 卡住", "💡 這步怎麼做"]);
+});
+
+test("[PR4] 步驟完成 → 問下一步什麼時候做；最後一步完成 → 整個目標完成", async () => {
+  const h = await setup();
+  const { goal, steps } = await setupGoal(h);
+  await h.tap(`系統：完成任務:${steps[0]}`);
+  assert.match(h.net.lastText(), /① 「確認有哪些報告要交、各自的要求」完成|①「確認有哪些報告要交、各自的要求」完成/);
+  assert.match(h.net.lastText(), /下一步是 ②「決定先做哪一份」/);
+  assert.equal(pendingRow(h).task_id, steps[1]);
+  for (const id of steps.slice(1)) await h.tap(`系統：完成任務:${id}`);
+  assert.match(h.net.lastText(), /全部完成/);
+  assert.equal(h.db.row("SELECT status FROM tasks WHERE id=?", goal).status, "completed");
+});
+
+test("[PR4] 下一步已經排好時間 → 完成時直接告訴你什麼時候", async () => {
+  const h = await setup();
+  const { steps } = await setupGoal(h);
+  await h.tap(`系統：步驟時間:${steps[1]}:tomorrow`);
+  await h.tap(`系統：完成任務:${steps[0]}`);
+  assert.match(h.net.lastText(), /已排在/);
+});
+
+test("[PR4] 💡 這步怎麼做 → 交給 AI，回覆具體做法，不排時間", async () => {
+  const h = await setup();
+  const { steps } = await setupGoal(h);
+  h.net.gemini = (t, prompt) => {
+    assert.match(prompt, /這一步：確認有哪些報告要交/);
+    return "• 打開課程網站\n• 列出每份報告的截止日";
+  };
+  await h.webhook([h.postbackEvent(`系統：步驟建議:${steps[0]}`)]);
+  await h.drainQueue();
+  assert.match(h.net.lastText(), /打開課程網站/);
+  assert.equal(h.db.row("SELECT session_at FROM tasks WHERE id=?", steps[0]).session_at, null);
+});
+
+test("[PR4] 一次排好 → AI 建議時間表（還沒存）→ 確認後每一步都有時間與提醒", async () => {
+  const h = await setup();
+  const { goal, steps } = await setupGoal(h);
+  const times = steps.map((_, i) => new Date(Date.now() + (5 + i * 3) * HOUR).toISOString());
+  h.net.gemini = (t, prompt) => {
+    assert.match(prompt, /明確要求/);
+    assert.match(prompt, /日期對照/);
+    return { sessions: steps.map((id, i) => ({ task_id: id, session_at: times[i] })), reply: "前面先做簡單的" };
+  };
+  await h.webhook([h.postbackEvent(`系統：排程方式:${goal}:all`)]);
+  await h.drainQueue();
+  assert.match(h.net.lastText(), /還沒存/);
+  assert.equal(h.db.row("SELECT COUNT(*) AS n FROM tasks WHERE session_at IS NOT NULL").n, 0);
+  await h.tap(h.net.lastMessage().quickReply.items[0].action.data);
+  assert.match(h.net.lastText(), /5 步都會在開始前提醒你/);
+  assert.equal(h.db.row("SELECT COUNT(*) AS n FROM tasks WHERE session_at IS NOT NULL AND remind_at IS NOT NULL").n, 5);
+});
+
+test("[PR4] 一次排好：AI 排出超過截止或過去的時間 → 被濾掉；全部無效就改一步一步", async () => {
+  const h = await setup();
+  const { goal, steps } = await setupGoal(h);
+  h.net.gemini = () => ({ sessions: [
+    { task_id: steps[0], session_at: tpe(2020, 1, 1, 10) },
+    { task_id: steps[1], session_at: tpe(2099, 1, 1, 10) },
+    { task_id: 99999, session_at: new Date(Date.now() + HOUR).toISOString() }
+  ] });
+  await h.webhook([h.postbackEvent(`系統：排程方式:${goal}:all`)]);
+  await h.drainQueue();
+  assert.match(h.net.lastText(), /一步一步來/);
+  assert.equal(pendingRow(h).action, "awaiting_step_time");
+});
+
+test("[PR4] 任務中心只列目標並顯示進度，不列出步驟", async () => {
+  const h = await setup();
+  const { steps } = await setupGoal(h);
+  await h.tap(`系統：完成任務:${steps[0]}`);
+  await h.tap("系統：任務分類:goal");
+  const flex = JSON.stringify(h.net.lastMessage().contents);
+  assert.match(flex, /心理實驗法報告/);
+  assert.match(flex, /進度 1\/5/);
+  assert.match(flex, /下一步：② 決定先做哪一份/);
+  assert.doesNotMatch(flex, /列報告架構/);
+});
+
+test("[PR4] 刪除目標 → 步驟一起移除，不會再提醒", async () => {
+  const h = await setup();
+  const { goal } = await setupGoal(h);
+  await h.tap(`系統：刪除任務:${goal}`);
+  await h.tap(h.net.lastMessage().quickReply.items[0].action.data);
+  assert.equal(h.db.row("SELECT COUNT(*) AS n FROM tasks WHERE status='pending'").n, 0);
+});
+
+test("[PR4 P2] prompt 附上未來 7 天的日期對照表", async () => {
+  const h = await setup();
+  await h.say("你好");
+  const prompt = h.net.geminiCalls.at(-1).prompt;
+  assert.match(prompt, /日期對照（台灣）：今天=\d{4}-\d{2}-\d{2}（星期.）、明天=/);
+});
+
+test("[PR4] 一次排好的時間表用打字修改 → 顯示步驟名稱的修改版，還要再確認", async () => {
+  const h = await setup();
+  const { goal, steps } = await setupGoal(h);
+  const times = steps.map((_, i) => new Date(Date.now() + (5 + i * 3) * HOUR).toISOString());
+  h.net.gemini = () => ({ sessions: steps.map((id, i) => ({ task_id: id, session_at: times[i] })) });
+  await h.webhook([h.postbackEvent(`系統：排程方式:${goal}:all`)]);
+  await h.drainQueue();
+  const later = new Date(Date.now() + 30 * HOUR).toISOString();
+  h.net.gemini = (t, prompt) => {
+    assert.match(prompt, /尚未確認的時間表/);
+    return { intent: "schedule_step", reply: "", sessions: steps.map((id, i) => ({ task_id: id, session_at: i === 1 ? later : times[i] })) };
+  };
+  const text = await h.say("第二步改到後天");
+  assert.match(text, /② .*決定先做哪一份/);
+  assert.equal(h.db.row("SELECT COUNT(*) AS n FROM tasks WHERE session_at IS NOT NULL").n, 0, "還沒確認就不寫入");
+});

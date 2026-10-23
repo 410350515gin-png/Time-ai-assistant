@@ -39,6 +39,8 @@ const INLINE_BUDGET_MS = 800;
 const LINE_CANCEL_OBSERVED_MS = 2200;                // 只用來說明安全邊際：所有 webhook 內的等待都必須遠小於這個值
 const GEMINI_TOTAL_DEADLINE_MS = 20 * 1000;          // 一次 AI 理解的總時間上限
 const LAST_TASK_CONTEXT_MINUTES = 30;                // 「剛剛在聊的任務」指標有效時間
+const DEFAULT_LEAD_MINUTES = 10;                     // 工作前提醒預設提前幾分鐘（使用者可改）
+const LAST_BOT_TURN_MINUTES = 30;                    // 「bot 上一句話」給 AI 參考的有效時間
 const RICH_MENU_NAME = "Pig Secretary Task Book v2";
 const RICH_MENU_SETTING_KEY = "default_rich_menu_id_v2";
 
@@ -335,6 +337,7 @@ async function processLineEvent(event, env, { allowAi, enqueuedAt = null }) {
   const handledAt = Date.now();
   const via = await deliver(env, uid, reply, event.replyToken, event.timestamp, eventId);
   await finishEvent(env.DB, eventId);
+  await recordBotTurn(env.DB, uid, reply);
 
   console.log("Event processed", {
     path: allowAi ? "queue" : "inline",
@@ -569,6 +572,40 @@ async function recordSentMessages(db, uid, message, sentMessages) {
   }
 }
 
+/**
+ * 記下 bot 這一輪說了什麼、是不是在請使用者確認某一份方案。
+ * 打字的確認字（好／好啊…）只能確認「上一輪正在請使用者確認」的那一份方案；
+ * bot 的話（不是使用者原文）也會給 AI 參考，讓「好啊」可以被理解成「同意你上一句的提議」。
+ */
+async function recordBotTurn(db, uid, message) {
+  if (!db || !uid) return;
+  try {
+    const planId = message && typeof message === "object" && message.promptPlanId ? String(message.promptPlanId) : null;
+    await db.prepare(
+      `INSERT INTO users(line_user_id,last_prompt_json,last_bot_text) VALUES (?,?,?)
+       ON CONFLICT(line_user_id) DO UPDATE SET last_prompt_json=excluded.last_prompt_json, last_bot_text=excluded.last_bot_text`
+    ).bind(uid, JSON.stringify({ plan_id: planId, at: Date.now() }), botText(message).slice(0, 300)).run();
+  } catch (err) {
+    console.warn("recordBotTurn failed", { message: err?.message || String(err) });
+  }
+}
+
+async function getLastBotTurn(db, uid) {
+  const row = await db.prepare("SELECT last_prompt_json, last_bot_text FROM users WHERE line_user_id=?").bind(uid).first();
+  let prompt = null;
+  try { prompt = row?.last_prompt_json ? JSON.parse(row.last_prompt_json) : null; } catch { prompt = null; }
+  const fresh = prompt && Number.isFinite(Number(prompt.at)) && Date.now() - Number(prompt.at) < LAST_BOT_TURN_MINUTES * 60000;
+  return {
+    planId: fresh ? prompt.plan_id || null : null,
+    text: fresh ? String(row?.last_bot_text || "") : ""
+  };
+}
+
+function botText(message) {
+  if (message && typeof message === "object") return String(message.text || "");
+  return String(message || "");
+}
+
 function toLineTextMessage(message) {
   if (message && typeof message === "object") {
     const out = { type: "text", text: String(message.text || "").slice(0, 5000) };
@@ -628,10 +665,12 @@ async function handleDeterministic(uid, text, env, meta = {}) {
     return "可以呀✏️ 直接用你平常說話的方式告訴我想怎麼改。";
   }
 
-  // 手打的確認字：只在「還沒過期」的待確認方案存在時才有效
+  // 手打的確認字：只有在「上一輪 bot 正在請使用者確認這一份方案」時才直接執行。
+  // 其他情況（例如 bot 剛在聊天裡提議修改）交給 AI 判斷，避免把「同意提議」當成「確認舊方案」。
   if (YES.has(lower) || NO.has(lower) || MODIFY.has(lower)) {
     const pending = await getPendingPlan(db, uid);
-    if (pending) {
+    const lastTurn = pending ? await getLastBotTurn(db, uid) : null;
+    if (pending && pending.action !== "awaiting_step_time" && lastTurn?.planId && lastTurn.planId === pending.id) {
       if (YES.has(lower)) return executePendingPlan(env, uid, pending);
       if (NO.has(lower)) {
         await clearPendingPlan(db, uid);
@@ -648,6 +687,17 @@ async function handleDeterministic(uid, text, env, meta = {}) {
 async function executePendingPlan(env, uid, pending) {
   const db = env.DB;
 
+  if (pending.action === "goal_steps") {
+    await clearPendingPlan(db, uid);
+    return saveGoalWithSteps(db, uid, pending.proposal);
+  }
+
+  if (pending.action === "schedule_all") return executeScheduleAll(db, uid, pending);
+
+  if (pending.action === "awaiting_step_time") {
+    return "這一步還在等你給時間🐽 選一個時間，或直接打時間給我就好。";
+  }
+
   if (pending.action === "delete_all") {
     const r = await db.prepare(
       "UPDATE tasks SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE line_user_id=? AND status IN ('pending','paused')"
@@ -663,8 +713,8 @@ async function executePendingPlan(env, uid, pending) {
     const placeholders = ids.map(() => "?").join(",");
     const r = await db.prepare(
       `UPDATE tasks SET status='cancelled', updated_at=CURRENT_TIMESTAMP
-       WHERE line_user_id=? AND status IN ('pending','paused') AND id IN (${placeholders})`
-    ).bind(uid, ...ids).run();
+       WHERE line_user_id=? AND status IN ('pending','paused') AND (id IN (${placeholders}) OR parent_id IN (${placeholders}))`
+    ).bind(uid, ...ids, ...ids).run();
     return `🗑️ 已移除 ${Number(r?.meta?.changes || 0)} 項任務，之後不會再提醒。`;
   }
 
@@ -799,6 +849,75 @@ async function handleFastPath(uid, s, env, meta = {}) {
     return closings[tag] || "記下來了🐽 今天先到這裡。";
   }
 
+  // 「只記截止」：存目標本身，不切步驟
+  const goalOnly = s.match(/^系統：只記目標:([A-Za-z0-9-]{4,40})$/u);
+  if (goalOnly) {
+    const pending = await getPendingPlan(db, uid);
+    if (!pending || pending.id !== goalOnly[1] || pending.action !== "goal_steps") {
+      return "這個方案已經過期或處理過了🐽 有需要再跟我說一次就好。";
+    }
+    await clearPendingPlan(db, uid);
+    return saveGoalOnly(db, uid, pending.proposal);
+  }
+
+  const deadlineReminder = s.match(/^系統：截止提醒:(\d+)$/u);
+  if (deadlineReminder) {
+    const id = Number(deadlineReminder[1]);
+    const goal = await db.prepare(
+      "SELECT id,title,due_time FROM tasks WHERE id=? AND line_user_id=? AND status IN ('pending','paused')"
+    ).bind(id, uid).first();
+    if (!goal?.due_time) return "找不到這個目標的截止時間了🐽";
+    const at = new Date(goal.due_time).getTime() - 24 * 3600000;
+    if (at <= Date.now() + 60000) return "離截止已經不到一天了，就不另外排提醒囉🐽";
+    await db.prepare(
+      "UPDATE tasks SET remind_at=?, reminder_sent_at=NULL, reminder_claimed_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=?"
+    ).bind(new Date(at).toISOString(), id, uid).run();
+    return `好🐽 ${fmtTaipei(at)} 提醒你「${goal.title}」明天截止。`;
+  }
+
+  // 排程方式：一步一步（決定性）；一次排好需要 AI → 回傳 null 交給 AI 流程
+  const scheduleMode = s.match(/^系統：排程方式:(\d+):(step|all)$/u);
+  if (scheduleMode && scheduleMode[2] === "step") {
+    const goalId = Number(scheduleMode[1]);
+    const next = await nextPendingStep(db, uid, goalId);
+    if (!next) return "這個目標沒有待做的步驟了🐽";
+    return askStepTime(db, uid, next.id);
+  }
+
+  const stepTime = s.match(/^系統：步驟時間:(\d+):(now|30m|tonight|tomorrow)$/u);
+  if (stepTime) {
+    const when = resolveTimeOption(stepTime[2]);
+    if (!when) return "這個時間怪怪的🐽";
+    return setStepSession(db, uid, Number(stepTime[1]), when);
+  }
+
+  const startStep = s.match(/^系統：開始步驟:(\d+)$/u);
+  if (startStep) {
+    const info = await loadStepInfo(db, uid, Number(startStep[1]));
+    if (!info || !["pending", "paused"].includes(info.task.status)) return "找不到這一步了🐽";
+    await logTaskEvent(db, Number(startStep[1]), uid, "session_started", "button");
+    return buildStartNowMessage(info);
+  }
+
+  const leadChoice = s.match(/^系統：改提前:(\d+)$/u);
+  if (leadChoice) return buildLeadChoiceMessage(Number(leadChoice[1]));
+
+  const leadSet = s.match(/^系統：設提前:(\d+):(\d{1,3})$/u);
+  if (leadSet) {
+    const minutes = Math.min(240, Number(leadSet[2]));
+    return setLeadMinutes(db, uid, Number(leadSet[1]), minutes);
+  }
+
+  const leadDefault = s.match(/^系統：預設提前:(\d{1,3})$/u);
+  if (leadDefault) {
+    const minutes = Math.min(240, Number(leadDefault[1]));
+    await db.prepare(
+      `INSERT INTO users(line_user_id,default_lead_minutes) VALUES (?,?)
+       ON CONFLICT(line_user_id) DO UPDATE SET default_lead_minutes=excluded.default_lead_minutes`
+    ).bind(uid, minutes).run();
+    return `好🐽 以後的步驟都${minutes ? `提前 ${minutes} 分鐘` : "準時"}提醒你。`;
+  }
+
   const stuck = s.match(/^系統：卡住任務:(\d+)$/u);
   if (stuck) {
     const task = await markTaskStuck(db, uid, Number(stuck[1]), "button");
@@ -876,7 +995,7 @@ async function handleFastPath(uid, s, env, meta = {}) {
   const done = s.match(/^系統：完成任務:(\d+)$/u);
   if (done) {
     const result = await completeTask(db, uid, Number(done[1]));
-    return result ? buildCompletionMessage(result, env) : "這項好像已經處理掉了🐽";
+    return result ? buildCompletionReply(db, uid, result, env) : "這項好像已經處理掉了🐽";
   }
 
   const del = s.match(/^系統：刪除任務:(\d+)$/u);
@@ -938,6 +1057,462 @@ async function handleFastPath(uid, s, env, meta = {}) {
 }
 
 /* ------------------------------------------------------------------------- *
+ * 工作切分與工作前提醒（docs/specs/work-sessions.md）
+ *
+ * 目標（goal）= 一筆 parent 任務；步驟 = parent_id 指向它的子任務，依 step_index 排序。
+ * 每一步可以有 session_at（預計開始工作）與 lead_minutes（提前幾分鐘提醒）；
+ * remind_at = session_at − 提前分鐘數，沿用既有的提醒 cron。
+ * AI 只建議步驟名稱；時間由使用者決定（或使用者選「一次排好」授權 AI 建議）。
+ * ------------------------------------------------------------------------- */
+
+const CIRCLED = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"];
+
+function stepLabel(index) {
+  return CIRCLED[Number(index) - 1] || `${index}.`;
+}
+
+function sanitizeGoalProposal(result) {
+  const g = result?.goal && typeof result.goal === "object" ? result.goal : {};
+  const title = String(g.title || "").trim().slice(0, 200);
+  const steps = (Array.isArray(result?.steps) ? result.steps : [])
+    .filter(x => x && (typeof x === "string" || x.title))
+    .map(x => (typeof x === "string" ? { title: x } : x))
+    .map(x => ({
+      title: String(x.title).trim().slice(0, 120),
+      first_step: x.first_step ? String(x.first_step).trim().slice(0, 300) : null
+    }))
+    .filter(x => x.title)
+    .slice(0, 8);
+  if (!title || !steps.length) return null;
+
+  // 截止時間只收使用者講的；AI 推測的不存
+  let due = g.due_source === "user" ? normalizeIso(g.due_time) : null;
+  if (due && new Date(due).getTime() <= Date.now()) due = null;
+  return { goal: { title, due_time: due, description: g.description ? String(g.description).slice(0, 500) : null }, steps };
+}
+
+function buildGoalStepsMessage(proposal, planId, heading = null) {
+  const { goal, steps } = proposal;
+  const lines = [
+    heading || "記下來了🐽",
+    `📌 ${goal.title}`,
+    goal.due_time ? `⏰ 截止：${fmtTaipei(goal.due_time)}` : null,
+    "",
+    "我建議切成這幾步：",
+    ...steps.map((x, i) => `${stepLabel(i + 1)} ${x.title}`),
+    "",
+    "要照這樣切嗎？想改哪一步直接跟我說。"
+  ].filter(x => x !== null);
+  return {
+    text: lines.join("\n"),
+    promptPlanId: planId,
+    quickReply: {
+      items: [
+        { type: "action", action: hiddenPostbackAction("✅ 照這樣切", `系統：確認方案:${planId}`, "照這樣切 ✅") },
+        { type: "action", action: hiddenPostbackAction("✏️ 我要改", `系統：修改方案:${planId}`, "我要改✏️") },
+        { type: "action", action: hiddenPostbackAction("📌 只記截止", `系統：只記目標:${planId}`, "先只記截止 📌") },
+        { type: "action", action: hiddenPostbackAction("先不要🙈", `系統：取消方案:${planId}`, "先不要🙈") }
+      ]
+    }
+  };
+}
+
+async function insertGoal(db, uid, goal, firstStep) {
+  const row = await db.prepare(
+    `INSERT INTO tasks(line_user_id,title,description,first_step,priority,due_time,task_type,status)
+     VALUES (?,?,?,?,3,?,'goal','pending') RETURNING id`
+  ).bind(uid, goal.title, goal.description || null, firstStep || goal.title, goal.due_time || null).first();
+  return Number(row.id);
+}
+
+/** 確認步驟建議 → 存目標與步驟，接著問要怎麼排時間。 */
+async function saveGoalWithSteps(db, uid, proposal) {
+  const { goal, steps } = proposal;
+  const goalId = await insertGoal(db, uid, goal, steps[0].first_step || steps[0].title);
+  await db.batch(steps.map((x, i) => db.prepare(
+    `INSERT INTO tasks(line_user_id,title,first_step,priority,task_type,status,parent_id,step_index)
+     VALUES (?,?,?,3,'goal','pending',?,?)`
+  ).bind(uid, x.title, x.first_step || x.title, goalId, i + 1)));
+  await logTaskEvent(db, goalId, uid, "steps_created", String(steps.length));
+
+  return {
+    text: `存好了✨\n📌 ${goal.title}${goal.due_time ? `\n⏰ 截止：${fmtTaipei(goal.due_time)}` : ""}\n已切成 ${steps.length} 步。\n\n要怎麼排時間？`,
+    taskId: goalId,
+    kind: "goal_saved",
+    quickReply: {
+      items: [
+        { type: "action", action: hiddenPostbackAction("🪜 一步一步來", `系統：排程方式:${goalId}:step`, "一步一步來 🪜") },
+        { type: "action", action: hiddenPostbackAction("📅 一次排好", `系統：排程方式:${goalId}:all`, "一次排好 📅") }
+      ]
+    }
+  };
+}
+
+async function saveGoalOnly(db, uid, proposal) {
+  const goalId = await insertGoal(db, uid, proposal.goal, proposal.steps[0]?.first_step || proposal.steps[0]?.title);
+  const due = proposal.goal.due_time;
+  const items = [];
+  if (due && new Date(due).getTime() - 24 * 3600000 > Date.now() + 60000) {
+    items.push({ type: "action", action: hiddenPostbackAction("⏰ 截止前一天提醒", `系統：截止提醒:${goalId}`, "截止前一天提醒我 ⏰") });
+  }
+  items.push({ type: "action", action: hiddenPostbackAction("👌 這樣就好", "系統：列出任務", "這樣就好 👌") });
+  return {
+    text: `記下來了📌 ${proposal.goal.title}${due ? `\n⏰ 截止：${fmtTaipei(due)}` : ""}\n想切步驟的時候再跟我說就好🐽`,
+    taskId: goalId,
+    kind: "goal_saved",
+    quickReply: { items }
+  };
+}
+
+async function loadStepInfo(db, uid, id) {
+  const task = await db.prepare(
+    `SELECT id,title,first_step,parent_id,step_index,session_at,lead_minutes,remind_at,status
+     FROM tasks WHERE id=? AND line_user_id=?`
+  ).bind(id, uid).first();
+  if (!task) return null;
+  if (!task.parent_id) return { task, goal: null, total: null };
+  const goal = await db.prepare("SELECT id,title,due_time FROM tasks WHERE id=? AND line_user_id=?").bind(task.parent_id, uid).first();
+  const count = await db.prepare(
+    "SELECT COUNT(*) AS n FROM tasks WHERE parent_id=? AND line_user_id=? AND status <> 'cancelled'"
+  ).bind(task.parent_id, uid).first();
+  return { task, goal, total: Number(count?.n || 0) };
+}
+
+function stepHeadline(info) {
+  if (!info.goal) return `📌 ${info.task.title}`;
+  return `📌 ${info.goal.title}\n第 ${info.task.step_index}/${info.total} 步：${info.task.title}`;
+}
+
+async function nextPendingStep(db, uid, goalId) {
+  return db.prepare(
+    `SELECT id FROM tasks WHERE parent_id=? AND line_user_id=? AND status IN ('pending','paused')
+     ORDER BY step_index ASC LIMIT 1`
+  ).bind(goalId, uid).first();
+}
+
+/** 給「什麼時候做」的選項（使用者自己選，不是 AI 決定）。 */
+function stepTimeOptions(taskId, nowMs = Date.now()) {
+  const l = tpeLocal(nowMs);
+  const minutesNow = l.hh * 60 + l.mm;
+  const opts = [
+    ["▶️ 現在開始", "now", "現在開始 ▶️"],
+    ["⏱ 30分鐘後", "30m", "30 分鐘後開始 ⏱"]
+  ];
+  if (minutesNow < 19 * 60 + 30) opts.push(["🌙 今晚 20:00", "tonight", "今晚 20:00 開始 🌙"]);
+  opts.push(["📅 明天 20:00", "tomorrow", "明天 20:00 開始 📅"]);
+  return opts.map(([label, code, display]) => ({
+    type: "action",
+    action: hiddenPostbackAction(label, `系統：步驟時間:${taskId}:${code}`, display)
+  }));
+}
+
+function resolveTimeOption(code, nowMs = Date.now()) {
+  const l = tpeLocal(nowMs);
+  if (code === "now") return nowMs;
+  if (code === "30m") return nowMs + 30 * 60000;
+  if (code === "tonight") return tpeToMs(l.y, l.m, l.d, 20, 0);
+  if (code === "tomorrow") return tpeToMs(l.y, l.m, l.d + 1, 20, 0);
+  return null;
+}
+
+/** 問某一步什麼時候做；同時記下「正在等這一步的時間」，使用者打字回時間時 AI 才知道是哪一步。 */
+async function askStepTime(db, uid, stepId, prefix = "") {
+  const info = await loadStepInfo(db, uid, stepId);
+  if (!info) return "找不到這一步了🐽";
+  await setPendingPlan(db, uid, { action: "awaiting_step_time", task_id: Number(stepId) });
+  const label = info.goal ? `${stepLabel(info.task.step_index)}「${info.task.title}」` : `「${info.task.title}」`;
+  return {
+    text: `${prefix}${label}想什麼時候做？\n選一個，或直接打時間給我（例如「今晚八點」）。`,
+    taskId: Number(stepId),
+    kind: "ask_time",
+    quickReply: { items: stepTimeOptions(stepId) }
+  };
+}
+
+async function getLeadMinutes(db, uid, task) {
+  if (task.lead_minutes !== null && task.lead_minutes !== undefined) return Number(task.lead_minutes);
+  const u = await db.prepare("SELECT default_lead_minutes FROM users WHERE line_user_id=?").bind(uid).first();
+  const d = u?.default_lead_minutes;
+  return d !== null && d !== undefined ? Number(d) : DEFAULT_LEAD_MINUTES;
+}
+
+function computeRemindAt(sessionMs, leadMinutes, nowMs = Date.now()) {
+  const remind = sessionMs - leadMinutes * 60000;
+  return Math.max(remind, nowMs + 30000); // 提醒時間已經過了就盡快提醒
+}
+
+/**
+ * 設定某一步的工作時間。sessionMs 在一分鐘內 → 視為「現在開始」，不排提醒。
+ * silent=true 時只寫入不產生回覆（一次排好時用）。
+ */
+async function setStepSession(db, uid, taskId, sessionMs, { silent = false } = {}) {
+  const info = await loadStepInfo(db, uid, taskId);
+  if (!info || !["pending", "paused"].includes(info.task.status)) return silent ? false : "找不到這一步了🐽";
+
+  const pending = await getPendingPlan(db, uid);
+  if (pending?.action === "awaiting_step_time" && Number(pending.task_id) === Number(taskId)) await clearPendingPlan(db, uid);
+
+  const now = Date.now();
+  if (sessionMs <= now + 60000) {
+    await db.prepare(
+      "UPDATE tasks SET session_at=?, remind_at=NULL, reminder_sent_at=NULL, reminder_claimed_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=?"
+    ).bind(new Date(now).toISOString(), taskId, uid).run();
+    await logTaskEvent(db, Number(taskId), uid, "session_started", "now");
+    return silent ? true : buildStartNowMessage(info);
+  }
+
+  const lead = await getLeadMinutes(db, uid, info.task);
+  const remindMs = computeRemindAt(sessionMs, lead, now);
+  await db.prepare(
+    `UPDATE tasks SET session_at=?, remind_at=?, reminder_sent_at=NULL, reminder_claimed_at=NULL, updated_at=CURRENT_TIMESTAMP
+     WHERE id=? AND line_user_id=?`
+  ).bind(new Date(sessionMs).toISOString(), new Date(remindMs).toISOString(), taskId, uid).run();
+  await logTaskEvent(db, Number(taskId), uid, "session_scheduled", String(lead));
+  if (silent) return true;
+
+  return {
+    text: `排好了⏰\n${stepHeadline(info)}\n開始：${fmtTaipei(sessionMs)}\n提醒：${fmtTaipei(remindMs)}${lead > 0 ? `（提前 ${lead} 分鐘）` : "（準時）"}`,
+    taskId: Number(taskId),
+    kind: "session_scheduled",
+    quickReply: {
+      items: [
+        { type: "action", action: hiddenPostbackAction("🔔 改提醒時間", `系統：改提前:${taskId}`, "改提醒時間 🔔") },
+        { type: "action", action: hiddenPostbackAction("👌 好", "系統：列出任務", "好 👌") }
+      ]
+    }
+  };
+}
+
+function buildStartNowMessage(info) {
+  const id = info.task.id;
+  return {
+    text: `開始囉▶️\n${stepHeadline(info)}\n👉 ${info.task.first_step || info.task.title}\n\n做完跟我說，卡住也沒關係🐽`,
+    taskId: Number(id),
+    kind: "session_started",
+    quickReply: {
+      items: [
+        { type: "action", action: hiddenPostbackAction("✅ 這步完成", `系統：完成任務:${id}`, "這一步完成 ✅") },
+        { type: "action", action: hiddenPostbackAction("🧩 卡住", `系統：卡住任務:${id}`, "卡住了 🧩") },
+        { type: "action", action: hiddenPostbackAction("💡 這步怎麼做", `系統：步驟建議:${id}`, "這步怎麼做？💡") }
+      ]
+    }
+  };
+}
+
+function buildLeadChoiceMessage(taskId) {
+  const opts = [[0, "準時"], [5, "5 分鐘"], [10, "10 分鐘"], [30, "30 分鐘"], [60, "1 小時"]];
+  return {
+    text: "要提前多久提醒你？",
+    quickReply: {
+      items: opts.map(([m, label]) => ({
+        type: "action",
+        action: hiddenPostbackAction(label, `系統：設提前:${taskId}:${m}`, m ? `提前 ${label}提醒` : "準時提醒")
+      }))
+    }
+  };
+}
+
+async function setLeadMinutes(db, uid, taskId, minutes) {
+  const info = await loadStepInfo(db, uid, taskId);
+  if (!info) return "找不到這一步了🐽";
+  let remindIso = info.task.remind_at;
+  if (info.task.session_at && new Date(info.task.session_at).getTime() > Date.now() + 60000) {
+    remindIso = new Date(computeRemindAt(new Date(info.task.session_at).getTime(), minutes)).toISOString();
+  }
+  await db.prepare(
+    `UPDATE tasks SET lead_minutes=?, remind_at=?,
+       reminder_sent_at=CASE WHEN ? = remind_at THEN reminder_sent_at ELSE NULL END,
+       reminder_claimed_at=CASE WHEN ? = remind_at THEN reminder_claimed_at ELSE NULL END,
+       updated_at=CURRENT_TIMESTAMP
+     WHERE id=? AND line_user_id=?`
+  ).bind(minutes, remindIso, remindIso, remindIso, taskId, uid).run();
+  return {
+    text: `改好了🔔 ${minutes ? `提前 ${minutes} 分鐘` : "準時"}提醒${remindIso && info.task.session_at ? `（${fmtTaipei(remindIso)}）` : ""}。\n以後的步驟也都這樣嗎？`,
+    taskId: Number(taskId),
+    quickReply: {
+      items: [
+        { type: "action", action: hiddenPostbackAction("👍 以後都這樣", `系統：預設提前:${minutes}`, "以後都這樣 👍") },
+        { type: "action", action: hiddenPostbackAction("只有這次", "系統：列出任務", "只有這次") }
+      ]
+    }
+  };
+}
+
+/** 步驟完成後的回覆：接下一步（已排時間就顯示，沒排就問），或整個目標完成。 */
+async function buildStepCompletionReply(db, uid, result, env) {
+  const goal = await db.prepare("SELECT id,title FROM tasks WHERE id=? AND line_user_id=?").bind(result.parent_id, uid).first();
+  const next = await nextPendingStep(db, uid, result.parent_id);
+  const doneLine = `做完啦✨ ${stepLabel(result.step_index)}「${result.title}」完成！`;
+
+  if (!next) {
+    const finished = await db.prepare(
+      "UPDATE tasks SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=? AND line_user_id=? AND status IN ('pending','paused') RETURNING id,title"
+    ).bind(result.parent_id, uid).first();
+    if (finished) await logTaskEvent(db, Number(result.parent_id), uid, "completed", "all_steps");
+    const msg = buildCompletionMessage({ title: goal?.title || result.title, recurring: false }, env);
+    return { ...msg, text: `${doneLine}\n\n🎉 「${goal?.title || ""}」全部完成，辛苦了🐽✨` };
+  }
+
+  const info = await loadStepInfo(db, uid, next.id);
+  const sessionMs = info.task.session_at ? new Date(info.task.session_at).getTime() : NaN;
+  if (Number.isFinite(sessionMs) && sessionMs > Date.now()) {
+    return {
+      text: `${doneLine}\n\n下一步：${stepLabel(info.task.step_index)}「${info.task.title}」\n已排在 ${fmtTaipei(sessionMs)}，到時候提醒你⏰`,
+      taskId: Number(next.id),
+      kind: "step_done"
+    };
+  }
+  return askStepTime(db, uid, next.id, `${doneLine}\n\n下一步是 `);
+}
+
+/** 完成任務時的回覆（一般任務、例行任務、步驟、整個目標都走這裡）。 */
+async function buildCompletionReply(db, uid, result, env) {
+  if (result.parent_id && !result.duplicate) return buildStepCompletionReply(db, uid, result, env);
+  return buildCompletionMessage(result, env);
+}
+
+/** 「一次排好」：使用者授權 AI 建議每一步的時間，存之前一定要使用者確認。 */
+async function proposeScheduleForGoal(env, uid, goalId) {
+  const db = env.DB;
+  const goal = await db.prepare(
+    "SELECT id,title,due_time FROM tasks WHERE id=? AND line_user_id=? AND status IN ('pending','paused')"
+  ).bind(goalId, uid).first();
+  if (!goal) return "找不到這個目標了🐽";
+  const steps = (await db.prepare(
+    `SELECT id,title,step_index FROM tasks WHERE parent_id=? AND line_user_id=? AND status IN ('pending','paused')
+     ORDER BY step_index ASC`
+  ).bind(goalId, uid).all()).results || [];
+  if (!steps.length) return "這個目標還沒有步驟喔🐽";
+
+  const now = tpeLocal(Date.now());
+  const prompt = `你是繁體中文的時間安排助理。使用者「明確要求」你幫他把一個目標的步驟排進時間表。
+現在台灣時間：${now.y}-${pad2(now.m)}-${pad2(now.d)} ${pad2(now.hh)}:${pad2(now.mm)}（星期${"日一二三四五六"[now.dow]}）
+${calendarTable(Date.now())}
+目標：${goal.title}
+截止：${goal.due_time ? fmtCompact(goal.due_time) : "沒有給"}
+步驟：
+${steps.map(s => `id=${s.id};${s.step_index}. ${s.title}`).join("\n")}
+
+規則：每一步給一個開始時間（台灣時間，必須帶 +08:00）；都要晚於現在、早於截止；不要排在 00:00–07:00；同一天的步驟至少間隔 1 小時。
+只輸出 JSON：{"sessions":[{"task_id":${steps[0].id},"session_at":"2026-01-01T20:00:00+08:00"}],"reply":"一句話說明這樣排的想法"}`;
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(stripFence(await callGemini(prompt, env, { jsonMode: true })));
+  } catch (err) {
+    console.error("Schedule proposal failed", { message: String(err?.message || err).slice(0, 200) });
+  }
+
+  const validIds = new Set(steps.map(s => Number(s.id)));
+  const dueMs = goal.due_time ? new Date(goal.due_time).getTime() : Infinity;
+  const sessions = (Array.isArray(parsed?.sessions) ? parsed.sessions : [])
+    .map(x => ({ task_id: Number(x?.task_id), session_at: normalizeIso(x?.session_at) }))
+    .filter(x => validIds.has(x.task_id) && x.session_at)
+    .filter(x => { const t = new Date(x.session_at).getTime(); return t > Date.now() && t < dueMs; });
+
+  if (!sessions.length) {
+    return askStepTime(db, uid, steps[0].id, "我這次排不出可靠的時間表🙈 我們先一步一步來：\n");
+  }
+
+  const saved = await setPendingPlan(db, uid, { action: "schedule_all", goal_id: Number(goalId), sessions });
+  const byId = new Map(steps.map(s => [Number(s.id), s]));
+  const lines = sessions
+    .sort((a, b) => byId.get(a.task_id).step_index - byId.get(b.task_id).step_index)
+    .map(x => `${stepLabel(byId.get(x.task_id).step_index)} ${fmtTaipei(x.session_at)}　${byId.get(x.task_id).title}`);
+  const reply = typeof parsed?.reply === "string" ? parsed.reply.slice(0, 200) : "";
+  return withPlanActions(
+    `我建議這樣排（還沒存）🐽\n📌 ${goal.title}\n${lines.join("\n")}${reply ? `\n\n${reply}` : ""}\n\n每一步會提前提醒你。要照這樣排嗎？想改哪一步直接跟我說。`,
+    saved.id
+  );
+}
+
+async function executeScheduleAll(db, uid, pending) {
+  let ok = 0;
+  let skipped = 0;
+  for (const x of pending.sessions || []) {
+    const t = new Date(x.session_at).getTime();
+    if (!Number.isFinite(t) || t <= Date.now() + 60000) { skipped++; continue; }
+    if (await setStepSession(db, uid, Number(x.task_id), t, { silent: true })) ok++; else skipped++;
+  }
+  await clearPendingPlan(db, uid);
+  return `排好了⏰ ${ok} 步都會在開始前提醒你。${skipped ? `\n⚠️ 有 ${skipped} 步的時間已經過了，之後再跟我說新的時間。` : ""}`;
+}
+
+/** 「💡 這步怎麼做」：使用者主動問才給做法；不排時間。 */
+async function buildStepAdvice(env, uid, stepId) {
+  const db = env.DB;
+  const info = await loadStepInfo(db, uid, stepId);
+  if (!info) return "找不到這一步了🐽";
+  const prompt = `你是溫和、具體的學習與工作教練，用繁體中文回答。
+使用者問「這一步怎麼做」。目標：${info.goal?.title || info.task.title}
+這一步：${info.task.title}
+請給 3–5 個很具體、馬上能做的小動作（每個一行，用「•」開頭），總共 150 字以內。
+不要排時間、不要說教、不要用「應該更努力」這類語氣。`;
+  try {
+    const advice = (await callGemini(prompt, env, { jsonMode: false })).trim().slice(0, 600);
+    return {
+      text: `💡 ${stepLabel(info.task.step_index || 1)}「${info.task.title}」可以這樣做：\n${advice}`,
+      taskId: Number(stepId),
+      kind: "advice",
+      quickReply: {
+        items: [
+          { type: "action", action: hiddenPostbackAction("▶️ 開始", `系統：開始步驟:${stepId}`, "開始 ▶️") },
+          { type: "action", action: hiddenPostbackAction("✅ 這步完成", `系統：完成任務:${stepId}`, "這一步完成 ✅") }
+        ]
+      }
+    };
+  } catch {
+    return "我這邊暫時想不出建議🙈 等一下再按一次「💡 這步怎麼做」好嗎？";
+  }
+}
+
+/** 未來 7 天的日期對照表，讓模型不用自己推算星期幾。 */
+function calendarTable(nowMs) {
+  const names = ["日", "一", "二", "三", "四", "五", "六"];
+  const tags = ["今天", "明天", "後天"];
+  const l = tpeLocal(nowMs);
+  const rows = [];
+  for (let i = 0; i < 8; i++) {
+    const d = tpeLocal(tpeToMs(l.y, l.m, l.d + i, 12, 0));
+    rows.push(`${tags[i] || `${i} 天後`}=${d.y}-${pad2(d.m)}-${pad2(d.d)}（星期${names[d.dow]}）`);
+  }
+  return `日期對照（台灣）：${rows.join("、")}`;
+}
+
+/* ------------------------------------------------------------------------- *
+ * AI 輸出的自主性邊界
+ * ------------------------------------------------------------------------- */
+
+/**
+ * 使用者沒有明確要求規劃時，AI 推算的開始時間、時長、優先順序、截止與提醒一律丟掉，
+ * 只留下使用者自己說的（sources = "user"）。使用者主動要求提醒（create_reminder）時保留提醒時間。
+ */
+function enforceAutonomy(items, { authorized, intent }) {
+  if (authorized) return items;
+  return items.map(x => {
+    const src = x.sources || {};
+    return {
+      ...x,
+      start_time: src.start_time === "user" ? x.start_time : null,
+      due_time: src.due_time === "user" ? x.due_time : null,
+      remind_at: intent === "create_reminder" || src.remind_at === "user" || x.time_semantics ? x.remind_at : null,
+      estimated_minutes: src.estimated_minutes === "user" ? x.estimated_minutes : null,
+      priority: 3,
+      reason: ""
+    };
+  });
+}
+
+function sanitizeSources(v) {
+  if (!v || typeof v !== "object") return {};
+  const out = {};
+  for (const k of ["start_time", "due_time", "remind_at", "estimated_minutes"]) {
+    if (v[k] === "user" || v[k] === "ai") out[k] = v[k];
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------------- *
  * 任務操作
  * ------------------------------------------------------------------------- */
 
@@ -949,7 +1524,7 @@ async function handleFastPath(uid, s, env, meta = {}) {
  */
 async function completeTask(db, uid, id) {
   const task = await db.prepare(
-    "SELECT id,title,recurrence_json,remind_at,reminder_sent_at FROM tasks WHERE id=? AND line_user_id=? AND status IN ('pending','paused')"
+    "SELECT id,title,recurrence_json,remind_at,reminder_sent_at,parent_id,step_index FROM tasks WHERE id=? AND line_user_id=? AND status IN ('pending','paused')"
   ).bind(id, uid).first();
   if (!task) return null;
 
@@ -994,7 +1569,11 @@ async function completeTask(db, uid, id) {
   ).bind(id, uid).first();
   if (!done) return null;
   await logTaskEvent(db, id, uid, "completed");
-  return { ...done, recurring: false };
+  // 直接完成整個目標 → 剩下的步驟一起收掉，不會再提醒
+  await db.prepare(
+    "UPDATE tasks SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE parent_id=? AND line_user_id=? AND status IN ('pending','paused')"
+  ).bind(id, uid).run();
+  return { ...done, recurring: false, parent_id: task.parent_id || null, step_index: task.step_index || null };
 }
 
 async function markTaskStuck(db, uid, id, source = "button") {
@@ -1140,6 +1719,7 @@ function hiddenPostbackAction(label, data, displayText = null) {
 function withDeleteActions(text, planId) {
   return {
     text,
+    promptPlanId: planId,
     quickReply: {
       items: [
         { type: "action", action: hiddenPostbackAction("確定刪除🗑️", `系統：確認方案:${planId}`, "確定刪除 🗑️") },
@@ -1160,7 +1740,7 @@ function withPlanActions(text, planId, allowCategoryChange = false) {
     { type: "action", action: hiddenPostbackAction("我要改✏️", `系統：修改方案:${planId}`, "我要改✏️") },
     { type: "action", action: hiddenPostbackAction("先不要🙈", `系統：取消方案:${planId}`, "先不要🙈") }
   );
-  return { text, quickReply: { items } };
+  return { text, promptPlanId: planId, quickReply: { items } };
 }
 
 /* ------------------------------------------------------------------------- *
@@ -1169,7 +1749,16 @@ function withPlanActions(text, planId, allowCategoryChange = false) {
 
 async function handleAiMessage(uid, text, env, meta = {}) {
   const db = env.DB;
+
+  // 需要 AI、但由按鈕觸發的動作
+  const adviceButton = String(text).match(/^系統：步驟建議:(\d+)$/u);
+  if (adviceButton) return buildStepAdvice(env, uid, Number(adviceButton[1]));
+  const scheduleAllButton = String(text).match(/^系統：排程方式:(\d+):all$/u);
+  if (scheduleAllButton) return proposeScheduleForGoal(env, uid, Number(scheduleAllButton[1]));
+  if (String(text).startsWith("系統：")) return "這個按鈕已經過期了🐽 可以從「查看所有任務」重新開始。";
+
   const pending = await getPendingPlan(db, uid);
+  const lastTurn = await getLastBotTurn(db, uid);
 
   const quotedTask = meta.quotedMessageId ? await findQuotedTask(db, uid, meta.quotedMessageId) : null;
   const lastTask = await findLastTaskContext(db, uid);
@@ -1184,13 +1773,28 @@ async function handleAiMessage(uid, text, env, meta = {}) {
     hints.push(`剛剛的對話正在談任務 id=${lastTask.id}「${lastTask.title}」（${lastTask.minutes_ago} 分鐘前）。短句若沒有指明別的任務，優先考慮它。`);
   }
 
-  const pendingContext = pending?.plan_items?.length
-    ? "尚未確認的方案：\n" + pending.plan_items.map((x, i) =>
-        `proposal_${i + 1};title=${x.title || ""};start=${fmtCompact(x.start_time)};due=${fmtCompact(x.due_time)};remind=${fmtCompact(x.remind_at)};first_step=${x.first_step || ""}`
-      ).join("\n")
-    : "";
+  let pendingContext = "";
+  if (pending?.plan_items?.length) {
+    pendingContext = "尚未確認的方案：\n" + pending.plan_items.map((x, i) =>
+      `proposal_${i + 1};title=${x.title || ""};start=${fmtCompact(x.start_time)};due=${fmtCompact(x.due_time)};remind=${fmtCompact(x.remind_at)};first_step=${x.first_step || ""}`
+    ).join("\n");
+  } else if (pending?.action === "goal_steps") {
+    const p = pending.proposal;
+    pendingContext = `尚未確認的步驟建議（目標「${p.goal.title}」${p.goal.due_time ? `，截止 ${fmtCompact(p.goal.due_time)}` : ""}）：\n` +
+      p.steps.map((x, i) => `${i + 1}. ${x.title}`).join("\n") +
+      "\n使用者想修改這些步驟時，用 intent=propose_steps 輸出完整修正版。";
+  } else if (pending?.action === "awaiting_step_time") {
+    const info = await loadStepInfo(db, uid, pending.task_id);
+    if (info) {
+      pendingContext = `目前在等使用者回答：任務 id=${info.task.id}「${info.task.title}」${info.goal ? `（目標「${info.goal.title}」第 ${info.task.step_index} 步）` : ""}想什麼時候開始做。使用者給了時間就用 intent=schedule_step、task_ids=[${info.task.id}]。`;
+    }
+  } else if (pending?.action === "schedule_all") {
+    pendingContext = "尚未確認的時間表：\n" + (pending.sessions || []).map(x => `id=${x.task_id};開始=${fmtCompact(x.session_at)}`).join("\n") +
+      "\n使用者想改某一步的時間時，用 intent=schedule_step 並在 sessions 輸出完整修正版時間表。";
+  }
 
   const context = [
+    lastTurn.text ? `你（bot）上一句對使用者說：「${lastTurn.text}」` : "",
     hints.length ? "對話線索：\n" + hints.join("\n") : "",
     active.text ? "現有待辦：\n" + active.text : "現有待辦：目前沒有",
     recent.text,
@@ -1220,6 +1824,8 @@ async function handleAiMessage(uid, text, env, meta = {}) {
       quoted_task: quotedTask?.id || null,
       quote_resolution: quoteOverride
     },
+    planning_authorized: Boolean(result.planning_authorized),
+    pending_action: pending?.action || (pending?.plan_items ? "plan" : null),
     fallback: Boolean(result._fallback),
     ai_ms: Date.now() - started,
     text_length: text.length
@@ -1245,7 +1851,7 @@ async function handleAiMessage(uid, text, env, meta = {}) {
       if (r) results.push(r);
     }
     if (!results.length) return "找不到這個待辦任務。";
-    if (results.length === 1) return buildCompletionMessage(results[0], env);
+    if (results.length === 1) return buildCompletionReply(db, uid, results[0], env);
     const msg = buildCompletionMessage(results[0], env);
     return {
       ...msg,
@@ -1295,8 +1901,47 @@ async function handleAiMessage(uid, text, env, meta = {}) {
     return withDeleteActions(`要移除 ${names} 嗎？\n移除後會停止提醒，但會保留歷史紀錄。`, saved.id);
   }
 
+  if (result.intent === "propose_steps") {
+    const proposal = sanitizeGoalProposal(result);
+    if (proposal) {
+      const saved = await setPendingPlan(db, uid, { action: "goal_steps", proposal });
+      const revising = pending?.action === "goal_steps";
+      return buildGoalStepsMessage(proposal, saved.id, revising ? "改好了，你看看這樣可以嗎🐽" : null);
+    }
+  }
+
+  if (result.intent === "schedule_step") {
+    // 正在確認「一次排好」的時間表：修改後重新給使用者確認，不直接寫入
+    if (pending?.action === "schedule_all" && Array.isArray(result.sessions) && result.sessions.length) {
+      const allowed = new Set((pending.sessions || []).map(x => Number(x.task_id)));
+      const sessions = result.sessions
+        .map(x => ({ task_id: Number(x?.task_id), session_at: normalizeIso(x?.session_at) }))
+        .filter(x => allowed.has(x.task_id) && x.session_at && new Date(x.session_at).getTime() > Date.now());
+      if (sessions.length) {
+        const saved = await setPendingPlan(db, uid, { ...pending, id: undefined, sessions });
+        const lines = [];
+        for (const x of sessions) {
+          const info = await loadStepInfo(db, uid, x.task_id);
+          lines.push(`${stepLabel(info?.task?.step_index || 0)} ${fmtTaipei(x.session_at)}　${info?.task?.title || ""}`);
+        }
+        return withPlanActions(`改好了，這樣排可以嗎🐽\n${lines.join("\n")}\n\n還沒存，選一下👇`, saved.id);
+      }
+    }
+    const ids = normalizeTaskIds(result.task_ids, result.task_id);
+    const target = ids[0] || (pending?.action === "awaiting_step_time" ? Number(pending.task_id) : null);
+    let when = normalizeIso(result.session_at);
+    if (!when && result.time_semantics?.kind === "relative") {
+      const unitMs = { minute: 60000, hour: 3600000, day: 86400000, week: 604800000 }[result.time_semantics.unit];
+      when = new Date(Date.now() + result.time_semantics.amount * unitMs).toISOString();
+    }
+    if (target && when) return setStepSession(db, uid, target, new Date(when).getTime());
+    return result.reply || "這個時間我還不敢直接幫你定，可以再講清楚一點嗎？例如「今晚八點」🐽";
+  }
+
   if (["propose_plan", "revise_plan", "create_reminder"].includes(result.intent)) {
     let items = sanitizePlanItems(result.plan_items);
+    // 使用者沒有明確要求規劃時，AI 自己推算的開始時間、時長、優先順序不保留
+    items = enforceAutonomy(items, { authorized: Boolean(result.planning_authorized), intent: result.intent });
 
     if (result.intent === "create_reminder" && items.length) {
       // 每個提醒用自己的相對時間；只有單一項目時才退回使用頂層 time_semantics（相容舊格式）。
@@ -1427,15 +2072,19 @@ async function recentRemindersContext(db, uid) {
 
 async function activeTasksContext(db, uid) {
   const r = await db.prepare(
-    `SELECT id,title,task_type,due_time,remind_at,stuck_count,recurrence_json
-     FROM tasks WHERE line_user_id=? AND status IN ('pending','paused')
-     ORDER BY COALESCE(remind_at, due_time, '9999-12-31'), priority ASC LIMIT 20`
+    `SELECT t.id,t.title,t.task_type,t.due_time,t.remind_at,t.stuck_count,t.recurrence_json,t.parent_id,t.step_index,t.session_at,
+            p.title AS goal_title
+     FROM tasks t LEFT JOIN tasks p ON p.id=t.parent_id
+     WHERE t.line_user_id=? AND t.status IN ('pending','paused')
+     ORDER BY COALESCE(t.session_at, t.remind_at, t.due_time, '9999-12-31'), t.priority ASC LIMIT 20`
   ).bind(uid).all();
   const rows = r.results || [];
   return {
     ids: rows.map(t => Number(t.id)),
     text: rows.map(t => {
       const bits = [`id=${t.id}`, `title=${t.title}`, `type=${t.task_type || "daily"}`];
+      if (t.parent_id) bits.push(`屬於目標「${t.goal_title || ""}」第 ${t.step_index} 步`);
+      if (t.session_at) bits.push(`開始=${fmtCompact(t.session_at)}`);
       if (t.recurrence_json) bits.push("例行");
       if (t.due_time && !t.recurrence_json) bits.push(`due=${fmtCompact(t.due_time)}`);
       if (t.remind_at) bits.push(`remind=${fmtCompact(t.remind_at)}`);
@@ -1547,6 +2196,7 @@ function sanitizePlanItems(items) {
         // 有 recurrence 一律是例行任務
         task_type: recurrence ? "routine" : (["routine", "goal", "daily"].includes(type) ? type : "daily"),
         time_semantics: sanitizeTimeSemantics(x.time_semantics),
+        sources: sanitizeSources(x.sources),
         reason: x.reason ? String(x.reason).slice(0, 500) : ""
       };
     });
@@ -1607,6 +2257,8 @@ async function interpretStructured(message, context, env) {
 - 不使用責備、羞辱、罪惡感或「應該更自律」式語氣。
 
 現在台灣時間：${taipeiNow}，時區 Asia/Taipei。
+${calendarTable(now)}
+（「今天、明天、星期幾」一律查上面的對照表，不要自己推算。）
 
 ${context}
 
@@ -1622,18 +2274,28 @@ ${context}
 9. 相對時間（「兩分鐘後」「半小時後」「1.5 小時後」「三天後」）：不要自己算時間，改在「該項目自己的」plan_items[].time_semantics 填 {kind:"relative", amount, unit}，unit 只能 minute|hour|day|week（半小時 = 30 minute）；該項 remind_at 填 null。一句話有多個提醒時，每個項目各填自己的 time_semantics。
 10. 絕對時間（「明早八點」「下週五下午三點」）：直接填 remind_at，time_semantics 填 {kind:"absolute"}。
 11. 「下午」預設 13:00–17:59，只說下午不要排到晚上。「週五前」= 最晚本週五當天。使用者給了截止日，due_time 不得晚於它。
-12. 使用者一次給多個任務時全部處理：找出依賴、優先順序、合理開始與截止時間；必要時比較衝突與負荷。除非使用者明確要求立即建立，否則用 propose_plan 提出方案讓他確認。資訊不足時保守，不要亂編固定行程。
+12. 使用者一次給多個任務時全部處理，用 propose_plan 提出方案讓他確認。**不要替使用者決定幾點開始、做多久、優先順序**：只有使用者明確要求你安排、排時間、規劃時（planning_authorized=true），才可以給 start_time、estimated_minutes 的建議。資訊不足時保守，不要亂編行程。
 13. 修改「尚未確認的方案」→ intent=revise_plan，輸出完整修正版 plan_items，不要另外新增無關任務。
 14. 每個 plan_item 的 first_step 必須是 2–10 分鐘內能立刻開始、做完看得出來的動作，不可只是把原任務換句話說。大型、模糊或容易拖延的任務，第一步只要求開始。
 15. 固定課表、每天/每週/每月 → 在 plan_items[].recurrence 填週期，不要展開成很多筆。格式：freq 只能 daily|weekly|monthly；interval 為整數；weekdays 用 0=週日…6=週六；time 用 HH:MM（台灣時間）；monthly 可填 day_of_month；until 為 ISO 或 null。例行任務可以不填 remind_at，程式會依 recurrence 算出第一次。
 16. task_type：routine＝固定重複的課表/習慣（有 recurrence 必為 routine）；goal＝報告、考試、專案、申請等需要多步驟推進的目標；daily＝洗衣、拿包裹、回電話等一次性生活雜事。
+17. 使用者描述一個需要多步驟的目標（報告、考試、專案、申請）→ intent=propose_steps：goal 填 title、due_time、due_source；steps 給 3–6 步，**只有名稱和順序，不給時間**。第一步要小而具體，常常是「確認範圍／有哪些要交、要求是什麼」。不要替使用者決定什麼時候做。
+18. 每個時間欄位都要標來源：plan_items[].sources 與 goal.due_source，"user"＝使用者明確說出的（包含「星期天晚上 9 點要交」這種截止），"ai"＝你推測或建議的。
+19. planning_authorized：只有使用者明確要求你「安排、排時間、規劃、幫我排」時才是 true；只是描述任務或截止時是 false。
+20. 「目前在等使用者回答某一步什麼時候做」時，使用者給了時間 → intent=schedule_step，task_ids=[那一步的 id]，session_at 填 ISO+08:00（相對時間改填 time_semantics）。
+21. 「你上一句對使用者說」是你自己剛說的話。使用者用「好啊」「可以」「對」同意你上一句的修改提議時：有待確認的方案或步驟 → 輸出修改後的完整版本（revise_plan 或 propose_steps）讓他再確認。**絕對不要把同意當成已經確認存檔**，也不要只回聊天說「好的」。
 
 JSON schema：
 {
-  "intent": "chat|propose_plan|revise_plan|create_reminder|list_tasks|complete_task|task_stuck|delete_task|delete_all_tasks|change_task_type",
+  "intent": "chat|propose_plan|revise_plan|create_reminder|propose_steps|schedule_step|list_tasks|complete_task|task_stuck|delete_task|delete_all_tasks|change_task_type",
   "reply": "給使用者看的繁體中文",
+  "planning_authorized": false,
   "task_ids": [3],
   "task_type": "routine|goal|daily 或 null",
+  "goal": { "title": "目標名稱", "due_time": "ISO8601+08:00 或 null", "due_source": "user|ai" },
+  "steps": [ { "title": "步驟名稱", "first_step": "這一步最小的開始動作" } ],
+  "session_at": "ISO8601+08:00 或 null（schedule_step 用）",
+  "sessions": [ { "task_id": 3, "session_at": "ISO8601+08:00" } ],
   "plan_items": [
     {
       "title": "任務名稱",
@@ -1647,6 +2309,7 @@ JSON schema：
       "estimated_minutes": 30,
       "task_type": "routine|goal|daily",
       "recurrence": null,
+      "sources": { "start_time": "user|ai", "due_time": "user|ai", "remind_at": "user|ai", "estimated_minutes": "user|ai" },
       "reason": "排序或安排理由（簡短）"
     }
   ]
@@ -1679,7 +2342,7 @@ ${message}`;
     return buildLocalFallback();
   }
 
-  const allowed = new Set(["chat", "propose_plan", "revise_plan", "create_reminder", "list_tasks", "complete_task", "task_stuck", "delete_task", "delete_all_tasks", "change_task_type"]);
+  const allowed = new Set(["chat", "propose_plan", "revise_plan", "create_reminder", "propose_steps", "schedule_step", "list_tasks", "complete_task", "task_stuck", "delete_task", "delete_all_tasks", "change_task_type"]);
   if (!allowed.has(parsed.intent)) parsed.intent = "chat";
   if (typeof parsed.reply !== "string") parsed.reply = "";
   parsed.reply = parsed.reply.slice(0, 1500);
@@ -1689,6 +2352,9 @@ ${message}`;
   parsed.task_id = parsed.task_id !== null && parsed.task_id !== undefined && Number.isInteger(n) ? n : null;
   parsed.time_semantics = sanitizeTimeSemantics(parsed.time_semantics);
   if (!Array.isArray(parsed.plan_items)) parsed.plan_items = [];
+  parsed.planning_authorized = parsed.planning_authorized === true;
+  if (!Array.isArray(parsed.steps)) parsed.steps = [];
+  if (!Array.isArray(parsed.sessions)) parsed.sessions = [];
   return parsed;
 }
 
@@ -1958,6 +2624,32 @@ function formatRecurrence(r) {
 
 const CLAIM_STALE_MINUTES = 5;
 
+/** 工作前提醒：「⏰ 10 分鐘後（20:00）要做：📌 報告 第 1/5 步：…」 */
+async function buildSessionReminder(db, task) {
+  const info = await loadStepInfo(db, task.line_user_id, task.id);
+  const sessionMs = task.session_at ? new Date(task.session_at).getTime() : NaN;
+  const minutes = Number.isFinite(sessionMs) ? Math.round((sessionMs - Date.now()) / 60000) : 0;
+  const when = !Number.isFinite(sessionMs)
+    ? "⏰ 該做這一步囉"
+    : minutes > 0
+      ? `⏰ ${minutes} 分鐘後（${fmtLocalTime(sessionMs)}）要做`
+      : `⏰ 現在要做（原本 ${fmtLocalTime(sessionMs)}）`;
+  const id = task.id;
+  return {
+    text: `${when}\n${info ? stepHeadline(info) : `📌 ${task.title}`}`,
+    taskId: Number(id),
+    kind: "session_reminder",
+    quickReply: {
+      items: [
+        { type: "action", action: hiddenPostbackAction("▶️ 開始了", `系統：開始步驟:${id}`, "開始了 ▶️") },
+        { type: "action", action: hiddenPostbackAction("⏰ 晚30分", `系統：延後任務:${id}:30`, "晚 30 分鐘再提醒我 ⏰") },
+        { type: "action", action: hiddenPostbackAction("🧩 卡住", `系統：卡住任務:${id}`, "卡住了 🧩") },
+        { type: "action", action: hiddenPostbackAction("💡 這步怎麼做", `系統：步驟建議:${id}`, "這步怎麼做？💡") }
+      ]
+    }
+  };
+}
+
 async function processDueReminders(env, scheduledTime) {
   if (!env.DB || !env.CHANNEL_ACCESS_TOKEN) return;
   const db = env.DB;
@@ -1965,7 +2657,7 @@ async function processDueReminders(env, scheduledTime) {
 
   const nowIso = new Date(scheduledTime || Date.now()).toISOString();
   const due = await db.prepare(
-    `SELECT id,line_user_id,title,due_time,remind_at,recurrence_json
+    `SELECT id,line_user_id,title,due_time,remind_at,recurrence_json,parent_id,step_index,session_at
      FROM tasks
      WHERE status='pending' AND remind_at IS NOT NULL AND remind_at <= ? AND reminder_sent_at IS NULL
        AND (reminder_claimed_at IS NULL OR reminder_claimed_at < datetime('now', ?))
@@ -1983,7 +2675,7 @@ async function processDueReminders(env, scheduledTime) {
     if (!claimed) continue; // 別的執行已經在處理
 
     const recurrence = parseRecurrenceJson(task.recurrence_json);
-    const message = {
+    const message = task.parent_id || task.session_at ? await buildSessionReminder(db, task) : {
       text: [
         `📌 ${task.title}`,
         task.due_time && !recurrence ? `⏰ 截止：${fmtTaipei(task.due_time)}` : null,
@@ -2018,6 +2710,7 @@ async function processDueReminders(env, scheduledTime) {
     }
 
     await recordSentMessages(db, task.line_user_id, message, sent);
+    await recordBotTurn(db, task.line_user_id, message);
     await logTaskEvent(db, Number(task.id), task.line_user_id, "reminder_sent", task.remind_at || null);
 
     const next = recurrence ? computeNextOccurrence(task.remind_at, recurrence, Date.now()) : null;
@@ -2106,6 +2799,7 @@ async function processEveningCheckins(env, scheduledTime) {
     try {
       const retryKey = await deterministicUuid(`evening:${uid}:${dateKey}`);
       await pushLine(env, uid, message, { retryKey, purpose: "evening" });
+      await recordBotTurn(db, uid, message);
       await db.prepare(
         "UPDATE daily_checkins SET sent_at=CURRENT_TIMESTAMP, claimed_at=NULL WHERE line_user_id=? AND date_key=?"
       ).bind(uid, dateKey).run();
@@ -2140,6 +2834,9 @@ const SCHEMA_STATEMENTS = [
     line_user_id TEXT PRIMARY KEY,
     last_task_id INTEGER,
     last_task_at TEXT,
+    default_lead_minutes INTEGER,
+    last_prompt_json TEXT,
+    last_bot_text TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
@@ -2169,6 +2866,10 @@ const SCHEMA_STATEMENTS = [
     task_type TEXT NOT NULL DEFAULT 'daily',
     stuck_count INTEGER NOT NULL DEFAULT 0,
     last_barrier TEXT,
+    parent_id INTEGER,
+    step_index INTEGER,
+    session_at TEXT,
+    lead_minutes INTEGER,
     status TEXT NOT NULL DEFAULT 'pending',
     reminder_sent_at TEXT,
     reminder_claimed_at TEXT,
@@ -2222,7 +2923,14 @@ const SCHEMA_ALTERS = [
   "ALTER TABLE webhook_events ADD COLUMN owner TEXT",
   "ALTER TABLE users ADD COLUMN last_task_id INTEGER",
   "ALTER TABLE users ADD COLUMN last_task_at TEXT",
-  "ALTER TABLE daily_checkins ADD COLUMN claimed_at TEXT"
+  "ALTER TABLE daily_checkins ADD COLUMN claimed_at TEXT",
+  "ALTER TABLE tasks ADD COLUMN parent_id INTEGER",
+  "ALTER TABLE tasks ADD COLUMN step_index INTEGER",
+  "ALTER TABLE tasks ADD COLUMN session_at TEXT",
+  "ALTER TABLE tasks ADD COLUMN lead_minutes INTEGER",
+  "ALTER TABLE users ADD COLUMN default_lead_minutes INTEGER",
+  "ALTER TABLE users ADD COLUMN last_prompt_json TEXT",
+  "ALTER TABLE users ADD COLUMN last_bot_text TEXT"
 ];
 
 const SCHEMA_INDEXES = [
@@ -2231,6 +2939,7 @@ const SCHEMA_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_tasks_remind ON tasks(remind_at)",
   "CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at)",
   "CREATE INDEX IF NOT EXISTS idx_task_events_user_type ON task_events(line_user_id, event_type, created_at)",
+  "CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id, step_index)",
   // 舊版例行任務資料修正（只影響尚未修正的列）
   "UPDATE tasks SET task_type='routine' WHERE recurrence_json IS NOT NULL AND recurrence_json <> '' AND task_type <> 'routine'"
 ];
@@ -2250,7 +2959,7 @@ function ensureSchemaOnce(db) {
 }
 
 // schema 有改動時就換一個版本號；已是最新版的資料庫，冷啟動只要查 1 次。
-const SCHEMA_VERSION = "2026-10-24.1";
+const SCHEMA_VERSION = "2026-10-24.2";
 
 async function runSchema(db) {
   try {
@@ -2414,7 +3123,14 @@ async function listTasksByType(db, uid, type) {
   }[type];
 
   const r = await db.prepare(
-    "SELECT id,title,due_time,remind_at,recurrence_json FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') AND task_type=? ORDER BY COALESCE(due_time,remind_at,'9999-12-31'), priority ASC LIMIT 12"
+    `SELECT t.id,t.title,t.due_time,t.remind_at,t.recurrence_json,
+            (SELECT COUNT(*) FROM tasks c WHERE c.parent_id=t.id AND c.status <> 'cancelled') AS steps_total,
+            (SELECT COUNT(*) FROM tasks c WHERE c.parent_id=t.id AND c.status='completed') AS steps_done,
+            (SELECT c.step_index || '|' || c.title || '|' || COALESCE(c.session_at,'') FROM tasks c
+              WHERE c.parent_id=t.id AND c.status IN ('pending','paused') ORDER BY c.step_index LIMIT 1) AS next_step
+     FROM tasks t
+     WHERE t.line_user_id=? AND t.status IN ('pending','paused') AND t.task_type=? AND t.parent_id IS NULL
+     ORDER BY COALESCE(t.due_time,t.remind_at,'9999-12-31'), t.priority ASC LIMIT 12`
   ).bind(uid, type).all();
 
   const rows = r.results || [];
@@ -2438,9 +3154,14 @@ async function listTasksByType(db, uid, type) {
   for (const t of rows.slice(0, 6)) {
     const when = t.remind_at || t.due_time;
     const recur = parseRecurrenceJson(t.recurrence_json);
-    const detail = recur
+    let detail = recur
       ? formatRecurrence(recur)
-      : (when ? fmtTaipei(when) : "尚未排時間");
+      : (t.due_time ? `截止 ${fmtTaipei(t.due_time)}` : (when ? fmtTaipei(when) : "尚未排時間"));
+    if (Number(t.steps_total) > 0) {
+      const [idx, stepTitle, sessionAt] = String(t.next_step || "").split("|");
+      const next = idx ? `｜下一步：${stepLabel(idx)} ${stepTitle}${sessionAt ? `（${fmtTaipei(sessionAt)}）` : ""}` : "";
+      detail += `\n進度 ${t.steps_done}/${t.steps_total}${next}`;
+    }
 
     contents.push({
       type: "box",

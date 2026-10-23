@@ -19,6 +19,7 @@ Reviewer（人或 AI）審 PR 時依照這份規則。
 
 ## 必查清單
 - [ ] 產品原則（見 `CLAUDE.md`）沒有被破壞：自然語言交給 AI、Fast Path 只處理決定性操作、non-shaming
+- [ ] AI 沒有在使用者沒要求時決定開始時間、時長、優先順序（`enforceAutonomy`）；打字的確認字只能確認 bot 上一輪正在請確認的方案
 - [ ] 所有 SQL 都限定在 `line_user_id`；AI 給的 task id 有再驗證
 - [ ] 時間計算有考慮台北時區、月底、隔週、UTC 日期與台北日期不同的時段
 - [ ] 失敗、retry、cron 重疊時，不會掉事件也不會重複送

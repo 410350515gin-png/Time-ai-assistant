@@ -142,3 +142,33 @@
 4. **LINE 方案**：pilot 第一週看 `/diag` 的 `push_usage`，再決定要不要升級中用量（台灣輕用量每月 200 則免費）。
 5. **兩段式 AI 呼叫**（先分類 intent，需要排程才帶完整 prompt），可以讓短句更快。
 6. **心情資料保留政策**：pilot 前跟朋友說明會記錄什麼，並決定保留多久。
+
+---
+
+# v0.4：工作切分、工作前提醒、使用者控制權（PR #4）
+
+> 規格：[`docs/specs/work-sessions.md`](../docs/specs/work-sessions.md)
+
+**修正 production E2E 發現的兩個 P1**
+| 問題 | 原因 | 修法（function） |
+|---|---|---|
+| 只給截止資訊，AI 就排了「開始 10/25 10:00、120 分鐘」 | prompt 規則 12 要 AI「找出合理開始時間」，schema 也要它填 `start_time` / `estimated_minutes` | prompt 改成不替使用者決定；AI 回傳 `planning_authorized` 與每個時間欄位的 `sources`；`enforceAutonomy()` 在沒授權時丟掉 AI 推算的開始時間、時長、優先順序、截止與提醒 |
+| bot 聊天裡提議「要不要改成兩天」，使用者回「好啊」→ 存了舊方案 | 打字的確認字只看「有沒有待確認方案」，不看 bot 上一句在問什麼 | `recordBotTurn()` 記下每一輪 bot 是否在請確認某份方案（`promptPlanId`）與 bot 的話；`handleDeterministic()` 只有在上一輪正在請確認那份方案時才直接存；其他情況交給 AI，AI 會拿到「你上一句說了什麼」，並被要求輸出修改版再確認 |
+
+**新功能：把大任務切成一段段工作，並在每段開始前提醒**
+- `propose_steps`：說了報告／考試等目標，就直接給 3–6 步建議（只有名稱和順序，沒有時間）→ 照這樣切／我要改／只記截止
+- 排程方式由使用者選：**一步一步**（`askStepTime`，提供現在／30 分後／今晚／明天的選項或打字）或**一次排好**（`proposeScheduleForGoal`，使用者授權 AI 建議時間表，確認後才寫入）
+- 工作前提醒：預設提前 10 分鐘（`DEFAULT_LEAD_MINUTES`），每一步可改，也可以設成之後的預設（`setLeadMinutes`、`users.default_lead_minutes`）
+- 提醒內容含目標、第幾步、開始時間，按鈕：開始了／晚 30 分／卡住／這步怎麼做（`buildSessionReminder`）
+- 完成一步後接下一步：已排就顯示時間，沒排就問；最後一步完成時整個目標完成（`buildStepCompletionReply`）
+- 「💡 這步怎麼做」：使用者問了才給具體做法（`buildStepAdvice`）
+- 任務中心只列目標，顯示「進度 2/5｜下一步：③ …」
+- 刪除或直接完成整個目標時，步驟也一起收掉
+
+**P2：日期錯亂**：prompt 附上未來 7 天的日期對照表（`calendarTable`），模型不用自己推算星期幾（原本把今天 10/24 星期六說成「明天（週六）」）。
+
+**資料**：`tasks.parent_id / step_index / session_at / lead_minutes`、`users.default_lead_minutes / last_prompt_json / last_bot_text`（只存 bot 自己的話），`SCHEMA_VERSION` 改成 `2026-10-24.2`，既有資料庫會自動補欄位。
+
+**新的 task_events**：`steps_created`、`session_scheduled`、`session_started`。
+
+**測試**：新增 22 項（共 76 項）。其中「AI 未授權排程被丟掉」與「截圖情境：好啊不能存舊方案」兩項在目前的 `main` 上會失敗。
