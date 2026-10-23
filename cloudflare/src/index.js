@@ -152,13 +152,26 @@ async function handleLineWebhook(request, env, ctx) {
 async function processQueuedLineEvent(event, env) {
   const isText = event?.type === "message" && event?.message?.type === "text";
   const isPostback = event?.type === "postback" && typeof event?.postback?.data === "string";
-  if (!isText && !isPostback) return;
+  const isFollow = event?.type === "follow";
+  if (!isText && !isPostback && !isFollow) return;
+
+  const uid = event?.source?.userId;
+  if (!uid) return;
+
+  if (isFollow) {
+    if (env.DB) {
+      await ensureSchema(env.DB);
+      await ensureUser(env.DB, uid);
+    }
+    await pushLine(uid, buildWelcomeMessage(), env.CHANNEL_ACCESS_TOKEN);
+    console.log("LINE welcome message sent");
+    return;
+  }
 
   const text = isPostback
     ? String(event.postback.data || "").trim()
     : String(event.message.text || "").trim();
-  const uid = event?.source?.userId;
-  if (!text || !uid) return;
+  if (!text) return;
 
   if (env.DB) {
     await ensureSchema(env.DB);
@@ -683,6 +696,31 @@ async function handleFastPath(uid, text, env) {
   }
 
   return null;
+}
+
+function buildWelcomeMessage() {
+  return {
+    text: [
+      "嗨～我是豬豬行程小秘書🐽",
+      "",
+      "想到什麼直接跟我說，我可以幫你：",
+      "📌 整理待辦和行程",
+      "🔁 記住課表、健身等固定安排",
+      "⏰ 到時間主動提醒",
+      "🎯 把太複雜的任務拆簡單",
+      "🧩 做不下去時，幫你換個比較好開始的方法",
+      "✅ 記錄完成進度",
+      "🌙 晚上回顧今天做了什麼、順便記錄心情",
+      "",
+      "不用先學指令，直接跟我說你想做什麼就好🐽"
+    ].join("\n"),
+    quickReply: {
+      items: [
+        { type: "action", action: { type: "message", label: "📌 建立任務", text: "我想新增一個任務" } },
+        { type: "action", action: hiddenPostbackAction("🐽 查看任務", "系統：列出任務", "查看所有任務") }
+      ]
+    }
+  };
 }
 
 function hiddenPostbackAction(label, data, displayText = null) {
