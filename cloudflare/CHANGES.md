@@ -78,7 +78,7 @@
 
 ---
 
-## 測試（`cloudflare/test/`，49 項全數通過）
+## 測試（`cloudflare/test/`，54 項全數通過）
 
 用 Node 內建的 SQLite 模擬 D1（bind `undefined` 會跟真的 D1 一樣報錯），並攔截 LINE 和 Gemini 的 HTTP 呼叫，整個 Worker 從 webhook 跑到 cron 做端對端測試。在 UTC 和 America/New_York 兩種主機時區下都通過。
 
@@ -98,6 +98,39 @@
 - 修正一個跟執行時刻有關的測試（例行任務完成）：原本半夜跑會失敗，現在固定在台灣時間中午。
 - 新增 `.github/workflows/worker-checks.yml`：PR 上會自動跑 `npm test` 與 `npm run check`（wrangler dry-run）。
 - 新增 `cloudflare/.gitignore`。
+
+---
+
+## PR #2：webhook 取消安全（production E2E blocker）
+
+**現象**：production log `POST /callback outcome: canceled wallTimeMs: 2274`。按「好呀🐽」、Rich Menu「查看所有任務」沒有立即回覆，任務中心有時延遲出現。
+
+**原因**：PR #1 讓 webhook 在回應前等 inline 處理，等到 `INLINE_BUDGET_MS = 2500` 才改送 Queue；但 LINE 約 2.2 秒就斷線，fallback 來不及執行。inline 會慢有三個原因：(1) isolate 冷啟動時 schema 檢查要依序跑約 27 次 D1；(2) Rich Menu 初始化（產生 PNG、呼叫多支 LINE API）也在 webhook 裡跑；(3) 按鈕流程本身約 10 次 D1 往返。
+
+**設計原則**：webhook 回應前只等「送進 Queue」這一步（通常幾十毫秒），不等任何 D1 或 LINE API；所有在 webhook 內的等待都要遠小於 LINE 斷線時間（約 2.2 秒）。
+
+| 修改 | function |
+|---|---|
+| **先有耐久紀錄，再嘗試 inline**：每個決定性事件一進來就送一份延遲 5 秒（`FALLBACK_DELAY_SECONDS`）的 Queue 備份，接著立刻回 200，inline 移到 `waitUntil` 背景。inline 正常完成後，備份到期時看到事件已 `done` 就略過 | `handleLineWebhook()`、`enqueueMessages()`、`runInlineInBackground()` |
+| Queue 不可用時才在 webhook 內等 inline，硬上限 **800ms**（`INLINE_BUDGET_MS`）；做不完或需要 AI 就回 503 讓 LINE 重送 | `settleInlineWithinBudget()` |
+| 事件租約分 owner：inline 15 秒（`INLINE_LEASE_MS`）、queue 90 秒。inline 剛處理完、可能還在送 reply 時，Queue 先退避，避免 reply 加 push 雙送；inline 被砍掉時，Queue 15 秒後就能接手 | `beginEvent()`、新欄位 `webhook_events.owner` |
+| Rich Menu 初始化移到 cron | `scheduled()` |
+| schema 版本號：已是最新版的資料庫，冷啟動只查 1 次 | `runSchema()`、`SCHEMA_VERSION` |
+
+**測試（新增 9 項，共 54 項）**：
+- `[PR2 P0] D1 很慢（inline 要好幾秒）+ LINE 約 2 秒斷線 → 斷線前事件已安全進 Queue；副作用與回覆各一次`
+- `[PR2 P0] inline 在背景被砍掉（送 reply 時永遠沒回來）→ Queue 備份接手，副作用與回覆各一次`
+- `[PR2 P0] inline 在 processing 階段被砍（租約沒放掉）→ inline 租約到期後 Queue 接手`
+- `[PR2 P0] Rich Menu postback「查看所有任務」：回應前已進 Queue，背景立刻回覆任務中心`
+- `[PR2 P0] Queue 掛掉 + inline 很快 → 在硬上限內完成，回 200`
+- `[PR2 P0] Queue 掛掉 + inline 很慢 → 硬上限（800ms）後回 503 讓 LINE 重送，不會拖到被斷線；重送後副作用仍只一次`
+- `[PR2 P0] Queue 掛掉 + inline 也失敗 → 回 5xx，不能回 200`
+- `[PR2 P0] Queue 掛掉時，需要 AI 的文字訊息 → 立刻回 503（不嘗試在 webhook 內呼叫 AI）`
+- `[PR2] 舊資料庫已是最新 schema 版本時，冷啟動只查 1 次`
+
+這些測試在目前的 `main` 上會失敗（其中 6 項是取消安全相關），在這個 PR 上全部通過。
+
+**取捨**：每次按鈕會多一則 Queue 訊息（延遲備份）。pilot 規模的成本可以忽略。
 
 ---
 

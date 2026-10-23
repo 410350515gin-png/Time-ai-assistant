@@ -55,8 +55,10 @@ test("成功路徑：自然語言提醒 → 待確認 → 按鈕確認 → 存�
   assert.match(confirm.data, /^系統：確認方案:/);
 
   await h.webhook([h.postbackEvent(confirm.data)]);
-  assert.equal(h.queue.length, 0, "按鈕不經過 queue");
   assert.match(h.net.lastText(), /存好 1 項/);
+  assert.equal(h.sentToQueue.at(-1).delaySeconds, 5, "按鈕只留一份延遲的 Queue 備份");
+  await h.drainQueue();
+  assert.equal(h.net.outgoing().length, 2, "備份到期時看到事件已完成，不會重送");
 
   const task = h.db.row("SELECT * FROM tasks");
   assert.equal(task.remind_at, `${ymd}T07:00:00.000Z`, "15:00 台灣 = 07:00Z");
@@ -123,7 +125,7 @@ test("D1 在 inline 處理時失敗 → 自動改走 queue，任務仍然存進�
 
   h.db.failNext(/INSERT INTO tasks/);
   await h.webhook([h.postbackEvent(data)]);
-  assert.equal(h.queue.length, 1, "inline 失敗後送進 queue");
+  assert.ok(h.queue.length >= 1, "inline 失敗後 Queue 裡有事件（延遲備份 + 立即補送）");
   await h.drainQueue();
   assert.equal(h.db.row("SELECT COUNT(*) AS n FROM tasks").n, 1);
   assert.match(h.net.lastText(), /存好 1 項/);
@@ -155,9 +157,11 @@ test("待確認方案過期後，一句「好」不會執行刪除", async () =>
   h.db.exec("UPDATE pending_plans SET updated_at=datetime('now','-31 minutes')");
 
   await h.webhook([h.textEvent("好")]);
-  assert.equal(h.queue.length, 1, "過期 → 當一般對話交給 AI");
+  assert.ok(h.queue.length >= 1, "過期 → 當一般對話交給 AI");
+  const before = h.net.geminiCalls.length;
   const r = await h.drainQueue();
-  assert.equal(r.acked, 1, "queue 不用等租約過期就能接手");
+  assert.equal(r.retried, 0, "queue 不用等租約過期就能接手");
+  assert.equal(h.net.geminiCalls.length - before, 1, "AI 只被呼叫一次");
   assert.equal(h.net.lastText(), "嗯嗯");
   assert.equal(h.db.row("SELECT status FROM tasks").status, "pending");
 });
@@ -507,14 +511,17 @@ test("晚間心情按鈕會記錄", async () => {
 test("舊版 Rich Menu 送來的「系統：任務首頁」也能直接開任務中心，不經過 AI", async () => {
   const h = await setup();
   await h.webhook([h.textEvent("系統：任務首頁")]);
-  assert.equal(h.queue.length, 0);
-  assert.equal(h.net.geminiCalls.length, 0);
   assert.equal(h.net.lastMessage().type, "flex");
+  await h.drainQueue();
+  assert.equal(h.net.geminiCalls.length, 0);
+  assert.equal(h.net.outgoing().length, 1);
 });
 
-test("新的 Rich Menu 使用 postback 並存成 v2 設定", async () => {
+test("新的 Rich Menu 使用 postback 並存成 v2 設定；初始化在 cron 做，不佔 webhook", async () => {
   const h = await setup();
   await h.webhook([h.textEvent("系統：列出任務")]);
+  assert.ok(!h.net.calls.some(c => c.path.startsWith("/v2/bot/richmenu")), "webhook 路徑不碰 Rich Menu");
+  await h.cron();
   const create = h.net.calls.find(c => c.path === "/v2/bot/richmenu");
   assert.equal(create.body.areas[0].action.type, "postback");
   assert.equal(create.body.areas[0].action.data, "系統：列出任務");
@@ -587,48 +594,6 @@ test("既有舊資料庫（舊 schema）可以直接升級", async () => {
 
 /* ============================== PR #1 review 修正 ============================== */
 
-test("[review P0] inline 失敗 + 進 Queue 也失敗 → webhook 回 5xx（讓 LINE 重送），不能回 200", async () => {
-  const h = await setup();
-  const id = h.insertTask({ title: "洗衣服" });
-  h.db.failNext(/UPDATE tasks\s+SET stuck_count/);   // inline 處理失敗
-  h.queueControl.failures = 5;                          // fallback 進 Queue 也失敗
-  const { status } = await h.webhookNoWait([h.postbackEvent(`系統：卡住任務:${id}`)]);
-  assert.ok(status >= 500, `應回 5xx，實際 ${status}`);
-  assert.equal(h.db.row("SELECT stuck_count FROM tasks WHERE id=?", id).stuck_count, 0);
-
-  // LINE 重送同一個事件 → 這次成功
-  h.queueControl.failures = 0;
-  const ev = h.postbackEvent(`系統：卡住任務:${id}`, { eventId: "evt-redeliver" });
-  h.db.failNext(/UPDATE tasks\s+SET stuck_count/);
-  h.queueControl.failures = 5;
-  assert.ok((await h.webhookNoWait([ev])).status >= 500);
-  h.queueControl.failures = 0;
-  const again = await h.webhookNoWait([ev]);
-  assert.equal(again.status, 200);
-  assert.equal(h.db.row("SELECT stuck_count FROM tasks WHERE id=?", id).stuck_count, 1, "副作用只做一次");
-});
-
-test("[review P0] inline 失敗但成功進 Queue → 回 200 前事件已經在 Queue 裡", async () => {
-  const h = await setup();
-  const id = h.insertTask({ title: "洗衣服" });
-  h.db.failNext(/UPDATE tasks\s+SET stuck_count/);
-  const { status } = await h.webhookNoWait([h.postbackEvent(`系統：卡住任務:${id}`)]);
-  assert.equal(status, 200);
-  assert.equal(h.queue.length, 1, "回 200 之前就已經進 Queue");
-  await h.drainQueue();
-  assert.equal(h.db.row("SELECT stuck_count FROM tasks WHERE id=?", id).stuck_count, 1);
-});
-
-test("[review P0] inline 成功 → 回 200 之前已經處理完並回覆", async () => {
-  const h = await setup();
-  const id = h.insertTask({ title: "洗衣服" });
-  const { status } = await h.webhookNoWait([h.postbackEvent(`系統：卡住任務:${id}`)]);
-  assert.equal(status, 200);
-  assert.equal(h.db.row("SELECT stuck_count FROM tasks WHERE id=?", id).stuck_count, 1);
-  assert.equal(h.net.replies().length, 1);
-  assert.equal(h.queue.length, 0);
-});
-
 test("[review P1] 兩個 processor 同時接手同一個 stale event → 只有一個成功，副作用只執行一次", async () => {
   const h = await setup();
   const id = h.insertTask({ title: "洗衣服" });
@@ -688,25 +653,149 @@ test("[review P1] 引用 B + AI 選 A 和 B，但只提到 B 的情境 → 只�
   assert.equal(h.db.row("SELECT status FROM tasks WHERE id=?", a).status, "pending");
 });
 
-test("[review P0] inline 處理超過時間上限 → 回 200 前先送進 Queue；背景處理完成後 Queue 不會重做", async () => {
+/* ============================== PR #2：webhook 取消安全 ============================== */
+
+const stuckCount = (h, id) => h.db.row("SELECT stuck_count FROM tasks WHERE id=?", id).stuck_count;
+
+test("[PR2 P0] D1 很慢（inline 要好幾秒）+ LINE 約 2 秒斷線 → 斷線前事件已安全進 Queue；副作用與回覆各一次", async () => {
+  const h = await setup();
+  const id = h.insertTask({ title: "洗衣服" });
+  h.db.latencyMs = 400; // 每次 D1 往返 400ms → inline 大約要 4–5 秒
+  const r = await h.webhookWithCancel([h.postbackEvent(`系統：卡住任務:${id}`)], 2000);
+
+  assert.equal(r.canceled, false, `webhook 必須在 2 秒內回應（實際 ${r.elapsedMs}ms）`);
+  assert.equal(r.status, 200);
+  assert.ok(r.elapsedMs < 1000, `回應時間要遠小於 LINE 斷線時間，實際 ${r.elapsedMs}ms`);
+  assert.equal(r.queueAtResponse, 1, "回應那一刻，延遲備份已經在 Queue 裡");
+  assert.equal(stuckCount(h, id), 0, "此時 inline 還沒做完");
+
+  await Promise.all(r.background);   // 背景 inline 做完
+  h.db.latencyMs = 0;
+  await h.drainQueue();              // 延遲備份到期
+  assert.equal(stuckCount(h, id), 1, "副作用只執行一次");
+  assert.equal(h.net.outgoing().length, 1, "LINE 回覆只送一次");
+});
+
+test("[PR2 P0] inline 在背景被砍掉（送 reply 時永遠沒回來）→ Queue 備份接手，副作用與回覆各一次", async () => {
   const h = await setup();
   const id = h.insertTask({ title: "洗衣服" });
   const realFetch = globalThis.fetch;
+  let hung = 0;
   globalThis.fetch = async (input, init) => {
     const url = String(typeof input === "string" ? input : input.url);
-    if (url.endsWith("/v2/bot/message/reply")) await new Promise(r => setTimeout(r, 3500)); // LINE 很慢
+    if (url.endsWith("/v2/bot/message/reply") && hung === 0) { hung++; return new Promise(() => {}); } // 第一次 reply 時 isolate 被砍：永遠不會完成
     return realFetch(input, init);
   };
   try {
-    const { status, background } = await h.webhookNoWait([h.postbackEvent(`系統：卡住任務:${id}`)]);
-    assert.equal(status, 200);
-    assert.equal(h.queue.length, 1, "超時的事件已經先進 Queue 當保險");
-    await Promise.all(background);
+    const r = await h.webhookWithCancel([h.postbackEvent(`系統：卡住任務:${id}`, { eventId: "evt-killed" })], 2000);
+    assert.equal(r.status, 200);
+    assert.equal(r.queueAtResponse, 1);
+    await new Promise(res => setTimeout(res, 50)); // 讓背景 inline 跑到卡住的 reply
+    assert.equal(hung, 1);
+    assert.equal(stuckCount(h, id), 1, "副作用已做（handled），只是回覆沒送出");
+
+    // 備份太早到：inline 可能還在送 reply → Queue 先退避，不重送
+    const early = await h.drainQueue();
+    assert.equal(early.retried, 1);
+    assert.equal(h.net.outgoing().length, 0);
+
+    // 超過 inline 租約 → Queue 補送（reply token 還有效就用 reply，否則用帶 retry key 的 push）
+    h.db.exec("UPDATE webhook_events SET updated_at=datetime('now','-1 minute') WHERE event_id='evt-killed'");
+    const late = await h.drainQueue();
+    assert.equal(late.acked, 1);
   } finally {
     globalThis.fetch = realFetch;
   }
-  const r = await h.drainQueue();
-  assert.equal(r.acked, 1);
-  assert.equal(h.db.row("SELECT stuck_count FROM tasks WHERE id=?", id).stuck_count, 1, "副作用只做一次");
-  assert.equal(h.net.outgoing().length, 1, "只回覆一次");
+  assert.equal(stuckCount(h, id), 1, "副作用只執行一次");
+  assert.equal(h.net.outgoing().length, 1, "回覆只送出一次（Queue 補送）");
+  assert.match(h.net.lastText(), /洗衣服/);
+  assert.equal(h.db.row("SELECT status FROM webhook_events WHERE event_id='evt-killed'").status, "done");
+});
+
+test("[PR2 P0] inline 在 processing 階段被砍（租約沒放掉）→ inline 租約到期後 Queue 接手", async () => {
+  const h = await setup();
+  const id = h.insertTask({ title: "洗衣服" });
+  const ev = h.postbackEvent(`系統：卡住任務:${id}`, { eventId: "evt-dead-inline", timestamp: Date.now() - 120000 });
+  h.db.exec("INSERT INTO webhook_events(event_id,status,owner,updated_at) VALUES ('evt-dead-inline','processing','inline',datetime('now','-5 seconds'))");
+  h.queue.push({ type: "LINE_EVENT", event: ev });
+  assert.equal((await h.drainQueue()).retried, 1, "inline 租約內先退避");
+  h.db.exec("UPDATE webhook_events SET updated_at=datetime('now','-20 seconds') WHERE event_id='evt-dead-inline'");
+  assert.equal((await h.drainQueue()).acked, 1, "15 秒 inline 租約到期就接手（不用等 90 秒）");
+  assert.equal(stuckCount(h, id), 1);
+  assert.equal(h.net.outgoing().length, 1);
+});
+
+test("[PR2 P0] Rich Menu postback「查看所有任務」：回應前已進 Queue，背景立刻回覆任務中心", async () => {
+  const h = await setup();
+  const r = await h.webhookWithCancel([h.postbackEvent("系統：列出任務")], 2000);
+  assert.equal(r.status, 200);
+  assert.equal(r.queueAtResponse, 1);
+  await Promise.all(r.background);
+  assert.equal(h.net.replies().length, 1, "用免費的 reply");
+  assert.equal(h.net.lastMessage().type, "flex");
+  await h.drainQueue();
+  assert.equal(h.net.outgoing().length, 1);
+});
+
+test("[PR2 P0] Queue 掛掉 + inline 很快 → 在硬上限內完成，回 200", async () => {
+  const h = await setup();
+  const id = h.insertTask({ title: "洗衣服" });
+  h.queueControl.failures = 1;
+  const r = await h.webhookWithCancel([h.postbackEvent(`系統：卡住任務:${id}`)], 2000);
+  assert.equal(r.status, 200);
+  assert.equal(stuckCount(h, id), 1);
+  assert.equal(h.net.replies().length, 1);
+});
+
+test("[PR2 P0] Queue 掛掉 + inline 很慢 → 硬上限（800ms）後回 503 讓 LINE 重送，不會拖到被斷線；重送後副作用仍只一次", async () => {
+  const h = await setup();
+  const id = h.insertTask({ title: "洗衣服" });
+  h.db.latencyMs = 400;
+  h.queueControl.failures = 1;
+  const ev = h.postbackEvent(`系統：卡住任務:${id}`, { eventId: "evt-queue-down" });
+  const r = await h.webhookWithCancel([ev], 2000);
+  assert.equal(r.canceled, false, `必須在斷線前回應（實際 ${r.elapsedMs}ms）`);
+  assert.ok(r.status >= 500);
+  assert.ok(r.elapsedMs < 1500, `硬上限要遠小於 2 秒，實際 ${r.elapsedMs}ms`);
+  await Promise.all(r.background);   // 原本的處理在背景做完
+  h.db.latencyMs = 0;
+
+  const again = await h.webhookWithCancel([ev], 2000); // LINE 重送
+  assert.equal(again.status, 200);
+  await Promise.all(again.background);
+  await h.drainQueue();
+  assert.equal(stuckCount(h, id), 1, "副作用只執行一次");
+  assert.equal(h.net.outgoing().length, 1, "回覆只送一次");
+});
+
+test("[PR2 P0] Queue 掛掉 + inline 也失敗 → 回 5xx，不能回 200", async () => {
+  const h = await setup();
+  const id = h.insertTask({ title: "洗衣服" });
+  h.db.failNext(/UPDATE tasks\s+SET stuck_count/);
+  h.queueControl.failures = 1;
+  const r = await h.webhookWithCancel([h.postbackEvent(`系統：卡住任務:${id}`)], 2000);
+  assert.ok(r.status >= 500);
+  assert.equal(stuckCount(h, id), 0);
+});
+
+test("[PR2 P0] Queue 掛掉時，需要 AI 的文字訊息 → 立刻回 503（不嘗試在 webhook 內呼叫 AI）", async () => {
+  const h = await setup();
+  h.queueControl.failures = 1;
+  const r = await h.webhookWithCancel([h.textEvent("明天提醒我繳費")], 2000);
+  assert.ok(r.status >= 500);
+  assert.ok(r.elapsedMs < 500);
+  assert.equal(h.net.geminiCalls.length, 0);
+});
+
+test("[PR2] 舊資料庫已是最新 schema 版本時，冷啟動只查 1 次", async () => {
+  const { FakeD1, loadWorker } = await import("./harness.mjs");
+  const db = new FakeD1();
+  const w1 = await loadWorker();
+  await w1.fetch(new Request("https://w.test/diag/reminders", { headers: { authorization: "Bearer t" } }), { DB: db, ADMIN_TOKEN: "t" }, { waitUntil() {} });
+  let count = 0;
+  const realPrepare = db.prepare.bind(db);
+  db.prepare = sql => { if (!/SELECT COUNT|SELECT MIN/.test(sql)) count++; return realPrepare(sql); };
+  const w2 = await loadWorker(); // 新的 isolate
+  await w2.fetch(new Request("https://w.test/diag/reminders", { headers: { authorization: "Bearer t" } }), { DB: db, ADMIN_TOKEN: "t" }, { waitUntil() {} });
+  assert.equal(count, 1, `schema 檢查只應該查 1 次，實際 ${count}`);
 });

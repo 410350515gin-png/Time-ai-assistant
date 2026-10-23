@@ -23,4 +23,5 @@ Reviewer（人或 AI）審 PR 時依照這份規則。
 - [ ] 時間計算有考慮台北時區、月底、隔週、UTC 日期與台北日期不同的時段
 - [ ] 失敗、retry、cron 重疊時，不會掉事件也不會重複送
 - [ ] 新增的 push 有決定性的 retry key 和 purpose
+- [ ] webhook 回應前沒有新增 D1、LINE API 或 AI 的等待（LINE 約 2.2 秒斷線）
 - [ ] `npm test` 全部通過，新行為有對應的測試

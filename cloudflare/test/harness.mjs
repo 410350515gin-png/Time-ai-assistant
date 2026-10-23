@@ -43,13 +43,15 @@ class FakeStatement {
     const r = st.run(...this.args);
     return { results: [], meta: { changes: Number(r.changes), last_row_id: Number(r.lastInsertRowid) } };
   }
-  async run() { return this._run(); }
+  async run() { await this.d1.lag(); return this._run(); }
   async first() {
+    await this.d1.lag();
     const st = this._stmt();
     const row = /\bRETURNING\b/i.test(this.sql) ? st.all(...this.args)[0] : st.get(...this.args);
     return row ? { ...row } : null;
   }
   async all() {
+    await this.d1.lag();
     return { results: this._stmt().all(...this.args).map(r => ({ ...r })) };
   }
 }
@@ -58,9 +60,11 @@ export class FakeD1 {
   constructor() {
     this.db = new DatabaseSync(":memory:");
     this.failRules = []; // { pattern, times }
+    this.latencyMs = 0;  // 模擬每次 D1 往返的延遲（production 上 D1 可能在別的區域）
   }
+  async lag() { if (this.latencyMs) await new Promise(r => setTimeout(r, this.latencyMs)); }
   prepare(sql) { return new FakeStatement(this, sql); }
-  async batch(stmts) { return stmts.map(s => s._run()); }
+  async batch(stmts) { await this.lag(); return stmts.map(s => s._run()); }
   failNext(pattern, times = 1) { this.failRules.push({ pattern, times }); }
   maybeFail(sql) {
     const rule = this.failRules.find(r => r.times > 0 && r.pattern.test(sql));
@@ -147,13 +151,14 @@ export async function setup() {
   const net = new FakeNetwork();
   globalThis.fetch = (input, init) => net.fetch(input, init);
   const queue = [];
+  const sentToQueue = [];          // 每一則送進 Queue 的訊息（含 delaySeconds），測試用
   const queueControl = { failures: 0 };
   const env = {
     DB: db,
     GEMINI_QUEUE: {
       async sendBatch(msgs) {
         if (queueControl.failures > 0) { queueControl.failures -= 1; throw new Error("simulated queue outage"); }
-        for (const m of msgs) queue.push(m.body);
+        for (const m of msgs) { queue.push(m.body); sentToQueue.push({ delaySeconds: m.delaySeconds || 0, body: m.body }); }
       },
       async send(body) {
         if (queueControl.failures > 0) { queueControl.failures -= 1; throw new Error("simulated queue outage"); }
@@ -170,7 +175,27 @@ export async function setup() {
 
   let seq = 0;
   const h = {
-    worker, db, net, env, queue, queueControl,
+    worker, db, net, env, queue, queueControl, sentToQueue,
+
+    /**
+     * 模擬 LINE 在 cancelAfterMs 後斷線（production 觀察到約 2.2 秒）。
+     * 回傳 { canceled, status, elapsedMs, queueAtResponse, background }：
+     * queueAtResponse 是「LINE 拿到回應（或斷線）那一刻」Queue 裡已有的訊息數。
+     */
+    async webhookWithCancel(events, cancelAfterMs = 2000) {
+      const raw = JSON.stringify({ destination: "x", events });
+      const signature = createHmac("sha256", env.CHANNEL_SECRET).update(raw).digest("base64");
+      const background = [];
+      const started = Date.now();
+      const responsePromise = worker.fetch(new Request("https://worker.test/webhook", {
+        method: "POST", headers: { "x-line-signature": signature, "content-type": "application/json" }, body: raw
+      }), env, { waitUntil: p => background.push(p) });
+      const outcome = await Promise.race([
+        responsePromise.then(res => ({ canceled: false, status: res.status })),
+        new Promise(r => setTimeout(() => r({ canceled: true, status: null }), cancelAfterMs))
+      ]);
+      return { ...outcome, elapsedMs: Date.now() - started, queueAtResponse: queue.length, background, responsePromise };
+    },
 
     /** 送 webhook，但「不等」waitUntil 的背景工作：用來確認回 200 之前已經做完的事。 */
     async webhookNoWait(events) {

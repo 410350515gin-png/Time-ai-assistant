@@ -23,8 +23,20 @@ const MODIFY = new Set(["修改","我要改","我要修改","調整","我要改�
 const TPE_OFFSET_MS = 8 * 60 * 60 * 1000;          // 台灣沒有日光節約時間，固定 +08:00
 const PENDING_PLAN_TTL_MINUTES = 30;                 // 待確認方案逾時
 const REPLY_TOKEN_SAFE_MS = 50 * 1000;               // reply token 只在事件後短時間內有效，超過就改用 push
-const EVENT_LEASE_MS = 90 * 1000;                    // 同一事件被其他執行中的 worker 處理時的租約
-const INLINE_BUDGET_MS = 2500;                       // webhook 內處理決定性事件的時間上限，超過就改送 Queue（保守值，避免 LINE webhook 逾時）
+const EVENT_LEASE_MS = 90 * 1000;                    // Queue 處理中的事件租約（AI 最長約 20 秒，留足餘裕）
+const INLINE_LEASE_MS = 15 * 1000;                   // Webhook 背景（inline）處理中的租約：inline 正常 1 秒內完成，被砍掉時 Queue 15 秒後可接手
+
+/*
+ * Webhook 取消安全設計（production 觀察到 LINE 約 2.2 秒就斷線、request 被 canceled）：
+ * - Webhook 回應前「只」等待送進 Queue 這一步（通常幾十毫秒），不等任何 D1 或 LINE API。
+ * - 決定性事件（按鈕）一進來就先寫一份「延遲 FALLBACK_DELAY_SECONDS 秒」的 Queue 備份，再在背景 inline 處理；
+ *   inline 正常完成後，Queue 備份到時候看到事件已完成就直接略過（webhook_events 冪等）。
+ * - 只有 Queue 掛掉時才在 webhook 內等 inline，而且有硬上限 INLINE_BUDGET_MS，遠低於 LINE 的斷線時間；
+ *   超過就回 503 讓 LINE 重送。
+ */
+const FALLBACK_DELAY_SECONDS = 5;
+const INLINE_BUDGET_MS = 800;
+const LINE_CANCEL_OBSERVED_MS = 2200;                // 只用來說明安全邊際：所有 webhook 內的等待都必須遠小於這個值
 const GEMINI_TOTAL_DEADLINE_MS = 20 * 1000;          // 一次 AI 理解的總時間上限
 const LAST_TASK_CONTEXT_MINUTES = 30;                // 「剛剛在聊的任務」指標有效時間
 const RICH_MENU_NAME = "Pig Secretary Task Book v2";
@@ -84,7 +96,11 @@ export default {
       await ensureSchemaOnce(env.DB);
       await Promise.all([
         processDueReminders(env, controller.scheduledTime),
-        processEveningCheckins(env, controller.scheduledTime)
+        processEveningCheckins(env, controller.scheduledTime),
+        // Rich Menu 初始化（產生 PNG、呼叫多支 LINE API）放在 cron，不佔用 webhook 的時間
+        env.CHANNEL_ACCESS_TOKEN
+          ? ensurePigRichMenu(env).catch(err => console.error("Rich Menu bootstrap failed", { message: err?.message || String(err) }))
+          : null
       ]);
     })().catch(err => {
       console.error("Cron failed", { name: err?.name || null, message: err?.message || String(err) });
@@ -149,14 +165,6 @@ async function handleLineWebhook(request, env, ctx) {
 
   const events = Array.isArray(body.events) ? body.events : [];
 
-  if (env.DB && env.CHANNEL_ACCESS_TOKEN) {
-    ctx.waitUntil(
-      ensurePigRichMenu(env).catch(err => {
-        console.error("Rich Menu bootstrap failed", { message: err?.message || String(err) });
-      })
-    );
-  }
-
   if (!env.GEMINI_QUEUE) {
     console.error("GEMINI_QUEUE binding missing");
     return json({ error: "queue unavailable" }, 503);
@@ -169,27 +177,38 @@ async function handleLineWebhook(request, env, ctx) {
     (isDeterministicCandidate(event) ? inline : queued).push(event);
   }
 
-  // 需要 AI 的事件在回應 LINE 之前就送進 Queue：失敗時回 503，讓 LINE 重送（需在 LINE Console 開啟 webhook redelivery）。
-  if (queued.length) {
+  // 1) 先讓每個事件都有「耐久的」Queue 紀錄，這是回 200 之前唯一要等的事（通常幾十毫秒）。
+  //    - 需要 AI 的事件：立刻處理
+  //    - 決定性事件：延遲 FALLBACK_DELAY_SECONDS 秒的備份；背景 inline 正常完成時，備份到時候會直接略過
+  const messages = [
+    ...queued.map(event => ({ event, delaySeconds: 0 })),
+    ...inline.map(event => ({ event, delaySeconds: FALLBACK_DELAY_SECONDS }))
+  ];
+
+  let durable = true;
+  if (messages.length) {
     try {
-      await enqueueEvents(env, queued);
+      await enqueueMessages(env, messages);
     } catch (err) {
+      durable = false;
       console.error("Queue enqueue failed", { message: err?.message || String(err) });
-      return json({ error: "queue enqueue failed" }, 503);
     }
+  }
+
+  if (durable) {
     for (const event of queued) ctx.waitUntil(startLoadingAnimation(env, event));
+    // 2) 背景處理按鈕：快、可以用免費的 reply。就算這裡被砍掉，Queue 備份也會接手。
+    for (const event of inline) ctx.waitUntil(runInlineInBackground(event, env));
+    return json({ status: "ok", inline: inline.length, queued: queued.length });
   }
 
-  // 決定性操作直接處理，速度快且通常可以用免費的 reply。
-  // 回 200 之前必須確定每個事件「已處理完」或「已成功進 Queue」；兩者都失敗就回 503 讓 LINE 重送。
-  const settled = await Promise.allSettled(inline.map(event => settleInline(event, env, ctx)));
-  const lost = settled.filter(r => r.status === "rejected");
-  if (lost.length) {
-    console.error("Inline events could not be processed or queued; asking LINE to redeliver", { count: lost.length });
-    return json({ error: "inline processing and fallback enqueue failed" }, 503);
+  // Queue 掛掉：需要 AI 的事件沒辦法在這裡處理 → 503 讓 LINE 重送。
+  // 決定性事件在硬上限 INLINE_BUDGET_MS 內嘗試 inline；做不完也回 503（重送時 webhook_events 會擋掉重複副作用）。
+  const results = await Promise.all(inline.map(event => settleInlineWithinBudget(event, env, ctx)));
+  if (queued.length || results.some(done => !done)) {
+    return json({ error: "queue unavailable and events not completed inline" }, 503);
   }
-
-  return json({ status: "ok", inline: inline.length, queued: queued.length });
+  return json({ status: "ok", inline: inline.length, queued: 0, degraded: true });
 }
 
 function isSupportedEvent(event) {
@@ -213,46 +232,54 @@ function isDeterministicCandidate(event) {
   return text.startsWith("系統：") || text === "查看所有任務" || YES.has(lower) || NO.has(lower) || MODIFY.has(lower);
 }
 
-async function enqueueEvents(env, events) {
+async function enqueueEvents(env, events, delaySeconds = 0) {
+  return enqueueMessages(env, events.map(event => ({ event, delaySeconds })));
+}
+
+async function enqueueMessages(env, items) {
   const now = Date.now();
-  await env.GEMINI_QUEUE.sendBatch(events.map(event => ({
-    body: { type: "LINE_EVENT", event, enqueued_at: now }
+  await env.GEMINI_QUEUE.sendBatch(items.map(({ event, delaySeconds }) => ({
+    body: { type: "LINE_EVENT", event, enqueued_at: now },
+    ...(delaySeconds ? { delaySeconds } : {})
   })));
 }
 
 /**
- * 在 webhook 回應之前處理一個決定性事件。
- * 回傳（resolve）代表事件「已處理完」或「已確定進入 Queue」；
- * reject 代表兩者都失敗 → 呼叫端回 5xx，讓 LINE 重送（webhook_events 會擋掉重複的副作用）。
- *
- * 處理超過 INLINE_BUDGET_MS 時，也改送 Queue 當保險，避免 LINE 的 webhook 逾時：
- * 原本那個處理會在背景繼續跑；Queue 端遇到還在租約內的事件會稍後重試，不會重做。
+ * 在 webhook 回應之後於背景處理決定性事件（durable 備份已經在 Queue 裡）。
+ * 需要 AI 或處理失敗時，再補一份「立即」的 Queue 訊息加快恢復；這一份失敗也沒關係，延遲備份仍會接手。
  */
-async function settleInline(event, env, ctx) {
-  const work = processLineEvent(event, env, { allowAi: false }).then(
-    outcome => ({ ok: true, outcome }),
-    err => ({ ok: false, err })
-  );
-  const result = await Promise.race([work, sleep(INLINE_BUDGET_MS).then(() => ({ timeout: true }))]);
-
-  if (result.ok && result.outcome !== "needs_ai") return "done";
-
-  if (result.timeout) {
-    console.warn("Inline processing exceeded budget; also enqueuing as a safety net");
-    ctx.waitUntil(work);
-  } else if (result.ok) {
-    ctx.waitUntil(startLoadingAnimation(env, event)); // 需要 AI
-  } else {
-    console.error("Inline processing failed; falling back to queue", { message: result.err?.message || String(result.err) });
-  }
-
+async function runInlineInBackground(event, env) {
   try {
-    await enqueueEvents(env, [event]);
-  } catch (enqueueErr) {
-    console.error("Fallback enqueue failed", { message: enqueueErr?.message || String(enqueueErr) });
-    throw enqueueErr;
+    const outcome = await processLineEvent(event, env, { allowAi: false });
+    if (outcome === "needs_ai") {
+      await startLoadingAnimation(env, event);
+      await enqueueEvents(env, [event]).catch(err =>
+        console.warn("Immediate AI enqueue failed; delayed backup will handle it", { message: err?.message || String(err) }));
+    }
+  } catch (err) {
+    console.error("Inline processing failed; delayed queue backup will retry", { message: err?.message || String(err) });
+    await enqueueEvents(env, [event]).catch(() => {});
   }
-  return "queued";
+}
+
+/**
+ * 只在 Queue 不可用時使用：在硬上限內等 inline。
+ * 回傳 true = 已處理完；false = 沒處理完（處理會在背景繼續，但呼叫端必須回 503）。
+ */
+async function settleInlineWithinBudget(event, env, ctx) {
+  const work = processLineEvent(event, env, { allowAi: false }).then(
+    outcome => outcome !== "needs_ai",
+    err => {
+      console.error("Inline processing failed while queue is down", { message: err?.message || String(err) });
+      return false;
+    }
+  );
+  const done = await Promise.race([work, sleep(INLINE_BUDGET_MS).then(() => null)]);
+  if (done === null) {
+    ctx.waitUntil(work);
+    return false;
+  }
+  return done;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -321,22 +348,32 @@ async function processLineEvent(event, env, { allowAi, enqueuedAt = null }) {
   return "done";
 }
 
+/**
+ * 事件 claim。owner = "inline"（webhook 背景）或 "queue"。
+ * - processing：租約內代表有人在處理；inline 的租約較短（INLINE_LEASE_MS），因為它可能隨 webhook 一起被砍掉
+ * - handled（副作用已做、回覆已存）：若是 inline 剛處理完、可能正在送 reply，Queue 先等一下，避免 reply + push 雙送
+ */
 async function beginEvent(db, eventId, { inline }) {
   if (!eventId) return { state: "new", reply: null };
+  const owner = inline ? "inline" : "queue";
 
   const inserted = await db.prepare(
-    "INSERT OR IGNORE INTO webhook_events(event_id,status,updated_at) VALUES (?,'processing',CURRENT_TIMESTAMP)"
-  ).bind(eventId).run();
+    "INSERT OR IGNORE INTO webhook_events(event_id,status,owner,updated_at) VALUES (?,'processing',?,CURRENT_TIMESTAMP)"
+  ).bind(eventId, owner).run();
   if (Number(inserted?.meta?.changes || 0) > 0) return { state: "new", reply: null };
 
   const row = await db.prepare(
-    "SELECT status, reply_json FROM webhook_events WHERE event_id=?"
+    `SELECT status, reply_json, owner,
+            (julianday('now') - julianday(updated_at)) * 86400000 AS age_ms
+     FROM webhook_events WHERE event_id=?`
   ).bind(eventId).first();
 
   const status = row?.status || "done";
   if (status === "done") return { state: "done", reply: null };
 
   if (status === "handled") {
+    const inlineMayBeDelivering = row.owner === "inline" && row.age_ms !== null && Number(row.age_ms) < INLINE_LEASE_MS;
+    if (inlineMayBeDelivering) return busy(inline, 20);
     let reply = null;
     try { reply = JSON.parse(row.reply_json); } catch { reply = null; }
     if (reply !== null) return { state: "handled", reply };
@@ -347,17 +384,23 @@ async function beginEvent(db, eventId, { inline }) {
   // 接手必須是原子的：「仍是 processing 且租約已過期」的判斷和更新在同一個 UPDATE 裡，
   // 多個 worker 同時嘗試時只有一個拿得到 RETURNING 的那一列。
   const takeover = await db.prepare(
-    `UPDATE webhook_events SET updated_at=CURRENT_TIMESTAMP
+    `UPDATE webhook_events SET updated_at=CURRENT_TIMESTAMP, owner=?
      WHERE event_id=? AND status='processing'
-       AND (updated_at IS NULL OR (julianday('now') - julianday(updated_at)) * 86400000 >= ?)
+       AND (updated_at IS NULL
+            OR (julianday('now') - julianday(updated_at)) * 86400000 >=
+               CASE WHEN owner='inline' THEN ? ELSE ? END)
      RETURNING event_id`
-  ).bind(eventId, EVENT_LEASE_MS).first();
+  ).bind(owner, eventId, INLINE_LEASE_MS, EVENT_LEASE_MS).first();
   if (takeover) return { state: "takeover", reply: null };
 
   // 沒搶到：別人正在處理（或剛處理完）。
+  return busy(inline, row?.owner === "inline" ? 20 : 60);
+}
+
+function busy(inline, retryDelaySeconds) {
   if (inline) return { state: "busy_skip", reply: null };
   const err = new Error("event is being processed elsewhere");
-  err.retryDelaySeconds = 60;
+  err.retryDelaySeconds = retryDelaySeconds;
   throw err;
 }
 
@@ -2088,6 +2131,7 @@ const SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS webhook_events (
     event_id TEXT PRIMARY KEY,
     status TEXT NOT NULL DEFAULT 'done',
+    owner TEXT,
     reply_json TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT
@@ -2175,6 +2219,7 @@ const SCHEMA_ALTERS = [
   "ALTER TABLE webhook_events ADD COLUMN status TEXT NOT NULL DEFAULT 'done'",
   "ALTER TABLE webhook_events ADD COLUMN reply_json TEXT",
   "ALTER TABLE webhook_events ADD COLUMN updated_at TEXT",
+  "ALTER TABLE webhook_events ADD COLUMN owner TEXT",
   "ALTER TABLE users ADD COLUMN last_task_id INTEGER",
   "ALTER TABLE users ADD COLUMN last_task_at TEXT",
   "ALTER TABLE daily_checkins ADD COLUMN claimed_at TEXT"
@@ -2192,7 +2237,7 @@ const SCHEMA_INDEXES = [
 
 let schemaReadyPromise = null;
 
-/** 每個 isolate 第一次用到 DB 時跑一次 schema 檢查，之後的訊息完全不付這個成本。 */
+/** 每個 isolate 第一次用到 DB 時檢查一次 schema（已是最新版只查 1 次），之後的訊息完全不付這個成本。 */
 function ensureSchemaOnce(db) {
   if (!db) return Promise.resolve();
   if (!schemaReadyPromise) {
@@ -2204,7 +2249,17 @@ function ensureSchemaOnce(db) {
   return schemaReadyPromise;
 }
 
+// schema 有改動時就換一個版本號；已是最新版的資料庫，冷啟動只要查 1 次。
+const SCHEMA_VERSION = "2026-10-24.1";
+
 async function runSchema(db) {
+  try {
+    const row = await db.prepare("SELECT value FROM app_settings WHERE key='schema_version'").first();
+    if (row?.value === SCHEMA_VERSION) return;
+  } catch {
+    // app_settings 還不存在（全新資料庫）→ 跑完整 schema
+  }
+
   for (const sql of SCHEMA_STATEMENTS) await db.prepare(sql).run();
   for (const sql of SCHEMA_ALTERS) {
     try {
@@ -2214,6 +2269,9 @@ async function runSchema(db) {
     }
   }
   for (const sql of SCHEMA_INDEXES) await db.prepare(sql).run();
+  await db.prepare(
+    "INSERT INTO app_settings(key,value,updated_at) VALUES('schema_version',?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP"
+  ).bind(SCHEMA_VERSION).run();
 }
 
 /* ------------------------------------------------------------------------- *
