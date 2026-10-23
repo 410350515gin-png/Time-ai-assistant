@@ -3,6 +3,8 @@ main = "src/index.js"
 compatibility_date = "2026-10-22"
 
 [vars]
+# 選填：GEMINI_THINKING_LEVEL（例如 "low"）或 GEMINI_THINKING_BUDGET（例如 "0"）可降低模型思考量、加快回應；
+# 值依模型而定，設錯該模型會回 400 並自動換下一個模型。先不設也可以。
 TIMEZONE = "Asia/Taipei"
 PUBLIC_BASE_URL = "https://time-ai-assistant.410350515gin.workers.dev"
 GEMINI_MODELS = "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.6-flash"
@@ -31,6 +33,8 @@ queue = "gemini-tasks"
 [[queues.consumers]]
 queue = "gemini-tasks"
 max_batch_size = 1
+# pilot 期間的保險絲：一次只處理一則，避免同一使用者的訊息並行。正式版應改成「同一使用者序列化」。
+max_concurrency = 1
 max_batch_timeout = 1
 max_retries = 3
 retry_delay = 30
