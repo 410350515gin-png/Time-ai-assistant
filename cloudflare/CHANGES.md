@@ -1,12 +1,33 @@
-# 豬豬行程小秘書 v0.3：pilot 前可靠性修正
+# 豬豬行程小秘書：變更紀錄
 
-> 這份文件是給接手的人（或 AI）看的變更說明。
-> 基準：repo `main` commit `d1761e0`（2026-10-23 22:51）
-> 改動檔案：`cloudflare/src/index.js`、`cloudflare/wrangler.toml`、`cloudflare/schema.sql`、`cloudflare/package.json`，新增 `cloudflare/test/`
+> 這份文件是給接手的人（或 AI）看的變更說明。最新的在上面。
+> 產品決策都沒有改：使用者不用記指令、手打的自然語言交給 AI、按鈕走 Fast Path、AI 不直接執行不可逆的操作、不診斷、不羞辱。
 
-產品決策都沒有改：使用者不用記指令、手打的自然語言交給 AI、按鈕走 Fast Path、AI 不直接執行不可逆的操作、不診斷、不羞辱。
+## 目前狀態（2026-10-24）
+
+| 版本 | PR | merge commit | 部署 |
+|---|---|---|---|
+| v0.3 pilot 前可靠性修正 | #1 | `bb24223` | 2026-10-24 00:07 自動部署 |
+| v0.3.1 webhook 取消安全 | #2 | `1a64df4` | 2026-10-24 02:03 自動部署 |
+
+`main` 在 Cloudflare Workers Builds build 成功後會**自動部署到 production**，所以 merge 就等於部署。
+
+**相關文件**
+- [`docs/e2e-acceptance.md`](../docs/e2e-acceptance.md)：production E2E 驗收紀錄（R2 待測）
+- [`docs/pilot-checklist.md`](../docs/pilot-checklist.md)：pilot 前、期間、結束的檢查清單
+- [`docs/observability.md`](../docs/observability.md)：`/diag`、log、D1 查詢的觀測方式
+- [`docs/incidents/2026-10-24-webhook-cancellation.md`](../docs/incidents/2026-10-24-webhook-cancellation.md)：PR #2 的 incident、root cause 與修正
+
+**已知問題**
+- Cloudflare Workers Builds 在非 main 分支會失敗（PR #1、#2 的分支都是），main 正常。完整 log 要登入 Cloudflare dashboard 才看得到，還沒查原因。
+- 提醒和晚間回顧送出成功時不寫 log，只能用 D1 查詢或 `push_usage` 確認（見 observability.md「已知的觀測缺口」）。
 
 ---
+
+# v0.3：pilot 前可靠性修正（PR #1）
+
+> 基準：`d1761e0`（2026-10-23 22:51）
+
 
 ## 部署前一定要做的事
 
@@ -101,7 +122,9 @@
 
 ---
 
-## PR #2：webhook 取消安全（production E2E blocker）
+# v0.3.1：webhook 取消安全（PR #2，production E2E blocker）
+
+> 完整的 incident 紀錄：[`docs/incidents/2026-10-24-webhook-cancellation.md`](../docs/incidents/2026-10-24-webhook-cancellation.md)
 
 **現象**：production log `POST /callback outcome: canceled wallTimeMs: 2274`。按「好呀🐽」、Rich Menu「查看所有任務」沒有立即回覆，任務中心有時延遲出現。
 
@@ -134,7 +157,7 @@
 
 ---
 
-## 還沒做（建議下一階段）
+# 還沒做（建議下一階段）
 
 1. **同一使用者的訊息序列化**：目前用 `max_concurrency = 1` 頂著，使用者變多之後會變慢。可以改用 Durable Object（每個使用者一個），或在 D1 上做每個使用者的租約。
 2. **AI 改回傳 date + time 欄位**，由程式組合時間（目前是補 `+08:00` 的短期解法）。
