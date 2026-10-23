@@ -355,17 +355,23 @@ test("做完 5 分鐘的 first_step ≠ 整個任務完成；之後再按整件�
 
 test("例行任務按完成 → 不會結束；今天的提醒還沒響就跳到下一次", async () => {
   const h = await setup();
-  const now = Date.now();
-  const local = new Date(now + 8 * HOUR);
-  // 今天稍晚的提醒（若已接近午夜則改用 1 分鐘後，仍在今天）
-  const later = Math.min(now + 2 * HOUR, Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate(), 23, 58) - 8 * HOUR);
-  const hhmm = new Date(later + 8 * HOUR).toISOString().slice(11, 16);
+  // 固定在台灣時間今天中午，避免測試結果跟執行時刻有關（例如半夜跑）
+  const realNow = Date.now;
+  const l = new Date(realNow() + 8 * HOUR);
+  const noon = Date.UTC(l.getUTCFullYear(), l.getUTCMonth(), l.getUTCDate(), 12, 0) - 8 * HOUR;
+  Date.now = () => noon;
+  const later = noon + 2 * HOUR; // 今天 14:00 的提醒
   const id = h.insertTask({
     title: "吃藥", task_type: "routine",
-    recurrence_json: JSON.stringify({ freq: "daily", interval: 1, time: hhmm }),
-    remind_at: new Date(later).toISOString().replace(/:\d\d\.\d+Z$/, ":00.000Z")
+    recurrence_json: JSON.stringify({ freq: "daily", interval: 1, time: "14:00" }),
+    remind_at: new Date(later).toISOString()
   });
-  const text = await h.tap(`系統：完成任務:${id}`);
+  let text;
+  try {
+    text = await h.tap(`系統：完成任務:${id}`);
+  } finally {
+    Date.now = realNow;
+  }
   assert.match(text, /下次/);
   const t = h.db.row("SELECT status, remind_at FROM tasks WHERE id=?", id);
   assert.equal(t.status, "pending");
@@ -577,4 +583,130 @@ test("既有舊資料庫（舊 schema）可以直接升級", async () => {
   assert.equal(db.row("SELECT status FROM webhook_events WHERE event_id='old-event'").status, "done", "舊事件視為已完成");
   const cols = db.rows("PRAGMA table_info(tasks)").map(c => c.name);
   for (const c of ["reminder_claimed_at", "recurrence_json", "task_type", "stuck_count"]) assert.ok(cols.includes(c), c);
+});
+
+/* ============================== PR #1 review 修正 ============================== */
+
+test("[review P0] inline 失敗 + 進 Queue 也失敗 → webhook 回 5xx（讓 LINE 重送），不能回 200", async () => {
+  const h = await setup();
+  const id = h.insertTask({ title: "洗衣服" });
+  h.db.failNext(/UPDATE tasks\s+SET stuck_count/);   // inline 處理失敗
+  h.queueControl.failures = 5;                          // fallback 進 Queue 也失敗
+  const { status } = await h.webhookNoWait([h.postbackEvent(`系統：卡住任務:${id}`)]);
+  assert.ok(status >= 500, `應回 5xx，實際 ${status}`);
+  assert.equal(h.db.row("SELECT stuck_count FROM tasks WHERE id=?", id).stuck_count, 0);
+
+  // LINE 重送同一個事件 → 這次成功
+  h.queueControl.failures = 0;
+  const ev = h.postbackEvent(`系統：卡住任務:${id}`, { eventId: "evt-redeliver" });
+  h.db.failNext(/UPDATE tasks\s+SET stuck_count/);
+  h.queueControl.failures = 5;
+  assert.ok((await h.webhookNoWait([ev])).status >= 500);
+  h.queueControl.failures = 0;
+  const again = await h.webhookNoWait([ev]);
+  assert.equal(again.status, 200);
+  assert.equal(h.db.row("SELECT stuck_count FROM tasks WHERE id=?", id).stuck_count, 1, "副作用只做一次");
+});
+
+test("[review P0] inline 失敗但成功進 Queue → 回 200 前事件已經在 Queue 裡", async () => {
+  const h = await setup();
+  const id = h.insertTask({ title: "洗衣服" });
+  h.db.failNext(/UPDATE tasks\s+SET stuck_count/);
+  const { status } = await h.webhookNoWait([h.postbackEvent(`系統：卡住任務:${id}`)]);
+  assert.equal(status, 200);
+  assert.equal(h.queue.length, 1, "回 200 之前就已經進 Queue");
+  await h.drainQueue();
+  assert.equal(h.db.row("SELECT stuck_count FROM tasks WHERE id=?", id).stuck_count, 1);
+});
+
+test("[review P0] inline 成功 → 回 200 之前已經處理完並回覆", async () => {
+  const h = await setup();
+  const id = h.insertTask({ title: "洗衣服" });
+  const { status } = await h.webhookNoWait([h.postbackEvent(`系統：卡住任務:${id}`)]);
+  assert.equal(status, 200);
+  assert.equal(h.db.row("SELECT stuck_count FROM tasks WHERE id=?", id).stuck_count, 1);
+  assert.equal(h.net.replies().length, 1);
+  assert.equal(h.queue.length, 0);
+});
+
+test("[review P1] 兩個 processor 同時接手同一個 stale event → 只有一個成功，副作用只執行一次", async () => {
+  const h = await setup();
+  const id = h.insertTask({ title: "洗衣服" });
+  const ev = h.postbackEvent(`系統：卡住任務:${id}`, { eventId: "evt-stale", timestamp: Date.now() - 120000 });
+  h.db.exec("INSERT INTO webhook_events(event_id,status,updated_at) VALUES ('evt-stale','processing',datetime('now','-10 minutes'))");
+
+  const results = [];
+  const run = () => {
+    const r = { acked: 0, retried: 0 };
+    results.push(r);
+    return h.worker.queue({ messages: [{ id: "x", body: { type: "LINE_EVENT", event: ev }, attempts: 2, ack() { r.acked++; }, retry() { r.retried++; } }] }, h.env);
+  };
+  await Promise.all([run(), run(), run()]);
+
+  assert.equal(h.db.row("SELECT stuck_count FROM tasks WHERE id=?", id).stuck_count, 1, "副作用只執行一次");
+  assert.equal(h.net.outgoing().length, 1, "只回覆一次");
+  assert.equal(h.db.row("SELECT COUNT(*) AS n FROM task_events WHERE event_type='stuck'").n, 1);
+  assert.equal(h.db.row("SELECT status FROM webhook_events WHERE event_id='evt-stale'").status, "done");
+});
+
+test("[review P1] 引用 B + AI 誤選 A + 使用者短句「還沒」→ 只會動到 B", async () => {
+  const h = await setup();
+  const at = new Date(Date.now() - 1000).toISOString();
+  const a = h.insertTask({ title: "A任務", remind_at: at });
+  const b = h.insertTask({ title: "B任務", remind_at: at });
+  await h.cron();
+  const msgOfB = h.db.row("SELECT message_id FROM bot_messages WHERE task_id=?", b).message_id;
+  h.net.gemini = () => ({ intent: "task_stuck", reply: "", task_ids: [a] }); // AI 選錯
+  await h.say("還沒", { quotedMessageId: msgOfB });
+  assert.equal(h.db.row("SELECT stuck_count FROM tasks WHERE id=?", b).stuck_count, 1);
+  assert.equal(h.db.row("SELECT stuck_count FROM tasks WHERE id=?", a).stuck_count, 0);
+});
+
+test("[review P1] 引用 B 但文字明確提到 A → 允許改成 A", async () => {
+  const h = await setup();
+  const at = new Date(Date.now() - 1000).toISOString();
+  const a = h.insertTask({ title: "繳電話費", remind_at: at });
+  const b = h.insertTask({ title: "洗衣服", remind_at: at });
+  await h.cron();
+  const msgOfB = h.db.row("SELECT message_id FROM bot_messages WHERE task_id=?", b).message_id;
+  h.net.gemini = () => ({ intent: "complete_task", reply: "", task_ids: [a] });
+  await h.say("不是這個，是電話費已經繳了", { quotedMessageId: msgOfB });
+  assert.equal(h.db.row("SELECT status FROM tasks WHERE id=?", a).status, "completed");
+  assert.equal(h.db.row("SELECT status FROM tasks WHERE id=?", b).status, "pending");
+});
+
+test("[review P1] 引用 B + AI 選 A 和 B，但只提到 B 的情境 → 只完成 B", async () => {
+  const h = await setup();
+  const at = new Date(Date.now() - 1000).toISOString();
+  const a = h.insertTask({ title: "繳電話費", remind_at: at });
+  const b = h.insertTask({ title: "洗衣服", remind_at: at });
+  await h.cron();
+  const msgOfB = h.db.row("SELECT message_id FROM bot_messages WHERE task_id=?", b).message_id;
+  h.net.gemini = () => ({ intent: "complete_task", reply: "", task_ids: [a, b] });
+  await h.say("好了", { quotedMessageId: msgOfB });
+  assert.equal(h.db.row("SELECT status FROM tasks WHERE id=?", b).status, "completed");
+  assert.equal(h.db.row("SELECT status FROM tasks WHERE id=?", a).status, "pending");
+});
+
+test("[review P0] inline 處理超過時間上限 → 回 200 前先送進 Queue；背景處理完成後 Queue 不會重做", async () => {
+  const h = await setup();
+  const id = h.insertTask({ title: "洗衣服" });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = String(typeof input === "string" ? input : input.url);
+    if (url.endsWith("/v2/bot/message/reply")) await new Promise(r => setTimeout(r, 3500)); // LINE 很慢
+    return realFetch(input, init);
+  };
+  try {
+    const { status, background } = await h.webhookNoWait([h.postbackEvent(`系統：卡住任務:${id}`)]);
+    assert.equal(status, 200);
+    assert.equal(h.queue.length, 1, "超時的事件已經先進 Queue 當保險");
+    await Promise.all(background);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  const r = await h.drainQueue();
+  assert.equal(r.acked, 1);
+  assert.equal(h.db.row("SELECT stuck_count FROM tasks WHERE id=?", id).stuck_count, 1, "副作用只做一次");
+  assert.equal(h.net.outgoing().length, 1, "只回覆一次");
 });

@@ -24,6 +24,7 @@ const TPE_OFFSET_MS = 8 * 60 * 60 * 1000;          // 台灣沒有日光節約�
 const PENDING_PLAN_TTL_MINUTES = 30;                 // 待確認方案逾時
 const REPLY_TOKEN_SAFE_MS = 50 * 1000;               // reply token 只在事件後短時間內有效，超過就改用 push
 const EVENT_LEASE_MS = 90 * 1000;                    // 同一事件被其他執行中的 worker 處理時的租約
+const INLINE_BUDGET_MS = 2500;                       // webhook 內處理決定性事件的時間上限，超過就改送 Queue（保守值，避免 LINE webhook 逾時）
 const GEMINI_TOTAL_DEADLINE_MS = 20 * 1000;          // 一次 AI 理解的總時間上限
 const LAST_TASK_CONTEXT_MINUTES = 30;                // 「剛剛在聊的任務」指標有效時間
 const RICH_MENU_NAME = "Pig Secretary Task Book v2";
@@ -180,7 +181,13 @@ async function handleLineWebhook(request, env, ctx) {
   }
 
   // 決定性操作直接處理，速度快且通常可以用免費的 reply。
-  for (const event of inline) ctx.waitUntil(runInline(event, env));
+  // 回 200 之前必須確定每個事件「已處理完」或「已成功進 Queue」；兩者都失敗就回 503 讓 LINE 重送。
+  const settled = await Promise.allSettled(inline.map(event => settleInline(event, env, ctx)));
+  const lost = settled.filter(r => r.status === "rejected");
+  if (lost.length) {
+    console.error("Inline events could not be processed or queued; asking LINE to redeliver", { count: lost.length });
+    return json({ error: "inline processing and fallback enqueue failed" }, 503);
+  }
 
   return json({ status: "ok", inline: inline.length, queued: queued.length });
 }
@@ -213,21 +220,39 @@ async function enqueueEvents(env, events) {
   })));
 }
 
-async function runInline(event, env) {
-  try {
-    const outcome = await processLineEvent(event, env, { allowAi: false });
-    if (outcome === "needs_ai") {
-      await startLoadingAnimation(env, event);
-      await enqueueEvents(env, [event]);
-    }
-  } catch (err) {
-    console.error("Inline processing failed; falling back to queue", { message: err?.message || String(err) });
-    try {
-      await enqueueEvents(env, [event]);
-    } catch (enqueueErr) {
-      console.error("Fallback enqueue failed; event may be lost", { message: enqueueErr?.message || String(enqueueErr) });
-    }
+/**
+ * 在 webhook 回應之前處理一個決定性事件。
+ * 回傳（resolve）代表事件「已處理完」或「已確定進入 Queue」；
+ * reject 代表兩者都失敗 → 呼叫端回 5xx，讓 LINE 重送（webhook_events 會擋掉重複的副作用）。
+ *
+ * 處理超過 INLINE_BUDGET_MS 時，也改送 Queue 當保險，避免 LINE 的 webhook 逾時：
+ * 原本那個處理會在背景繼續跑；Queue 端遇到還在租約內的事件會稍後重試，不會重做。
+ */
+async function settleInline(event, env, ctx) {
+  const work = processLineEvent(event, env, { allowAi: false }).then(
+    outcome => ({ ok: true, outcome }),
+    err => ({ ok: false, err })
+  );
+  const result = await Promise.race([work, sleep(INLINE_BUDGET_MS).then(() => ({ timeout: true }))]);
+
+  if (result.ok && result.outcome !== "needs_ai") return "done";
+
+  if (result.timeout) {
+    console.warn("Inline processing exceeded budget; also enqueuing as a safety net");
+    ctx.waitUntil(work);
+  } else if (result.ok) {
+    ctx.waitUntil(startLoadingAnimation(env, event)); // 需要 AI
+  } else {
+    console.error("Inline processing failed; falling back to queue", { message: result.err?.message || String(result.err) });
   }
+
+  try {
+    await enqueueEvents(env, [event]);
+  } catch (enqueueErr) {
+    console.error("Fallback enqueue failed", { message: enqueueErr?.message || String(enqueueErr) });
+    throw enqueueErr;
+  }
+  return "queued";
 }
 
 /* ------------------------------------------------------------------------- *
@@ -305,9 +330,7 @@ async function beginEvent(db, eventId, { inline }) {
   if (Number(inserted?.meta?.changes || 0) > 0) return { state: "new", reply: null };
 
   const row = await db.prepare(
-    `SELECT status, reply_json,
-            (julianday('now') - julianday(updated_at)) * 86400000 AS age_ms
-     FROM webhook_events WHERE event_id=?`
+    "SELECT status, reply_json FROM webhook_events WHERE event_id=?"
   ).bind(eventId).first();
 
   const status = row?.status || "done";
@@ -320,17 +343,22 @@ async function beginEvent(db, eventId, { inline }) {
     return { state: "done", reply: null };
   }
 
-  // status === "processing"：可能是別的 worker 正在處理，也可能是之前當掉。
-  if (Number(row?.age_ms || 0) < EVENT_LEASE_MS) {
-    if (inline) return { state: "busy_skip", reply: null };
-    const err = new Error("event is being processed elsewhere");
-    err.retryDelaySeconds = 60;
-    throw err;
-  }
+  // status === "processing"：可能是別的 worker 正在處理，也可能是之前當掉（租約過期）。
+  // 接手必須是原子的：「仍是 processing 且租約已過期」的判斷和更新在同一個 UPDATE 裡，
+  // 多個 worker 同時嘗試時只有一個拿得到 RETURNING 的那一列。
+  const takeover = await db.prepare(
+    `UPDATE webhook_events SET updated_at=CURRENT_TIMESTAMP
+     WHERE event_id=? AND status='processing'
+       AND (updated_at IS NULL OR (julianday('now') - julianday(updated_at)) * 86400000 >= ?)
+     RETURNING event_id`
+  ).bind(eventId, EVENT_LEASE_MS).first();
+  if (takeover) return { state: "takeover", reply: null };
 
-  // 租約過期：接手重做。副作用 SQL 都有 status 條件，重做大多是安全的。
-  await db.prepare("UPDATE webhook_events SET updated_at=CURRENT_TIMESTAMP WHERE event_id=?").bind(eventId).run();
-  return { state: "takeover", reply: null };
+  // 沒搶到：別人正在處理（或剛處理完）。
+  if (inline) return { state: "busy_skip", reply: null };
+  const err = new Error("event is being processed elsewhere");
+  err.retryDelaySeconds = 60;
+  throw err;
 }
 
 /** 處理失敗或要轉交 queue 時放掉租約，讓下一個處理者可以立刻接手。 */
@@ -1129,10 +1157,13 @@ async function handleAiMessage(uid, text, env, meta = {}) {
   const started = Date.now();
   const result = await interpretStructured(text, context, env);
 
-  // 引用回覆是決定性的線索：AI 判斷是完成/卡住但沒選出任務時，直接用被引用的任務。
-  if (quotedTask && ["task_stuck", "complete_task"].includes(result.intent)) {
-    const ids = normalizeTaskIds(result.task_ids, result.task_id);
-    if (!ids.length) result.task_ids = [quotedTask.id];
+  // 引用回覆是決定性的線索：被引用的任務優先，AI 的選擇只有在文字明確提到別的任務時才能改掉它。
+  let quoteOverride = null;
+  if (quotedTask && QUOTE_TARGET_INTENTS.has(result.intent)) {
+    const resolved = await resolveQuotedTarget(db, uid, text, quotedTask, normalizeTaskIds(result.task_ids, result.task_id));
+    result.task_ids = resolved.ids;
+    result.task_id = null;
+    quoteOverride = resolved.reason;
   }
 
   console.log("AI decision", {
@@ -1143,7 +1174,8 @@ async function handleAiMessage(uid, text, env, meta = {}) {
       active: active.ids.length,
       recent_reminders: recent.ids,
       last_task: lastTask?.id || null,
-      quoted_task: quotedTask?.id || null
+      quoted_task: quotedTask?.id || null,
+      quote_resolution: quoteOverride
     },
     fallback: Boolean(result._fallback),
     ai_ms: Date.now() - started,
@@ -1254,6 +1286,56 @@ async function handleAiMessage(uid, text, env, meta = {}) {
   }
 
   return result.reply || "我有收到，但目前還不能安全判斷你想執行哪個操作。";
+}
+
+// 會「指定某個任務」的 intent：有引用回覆時，目標任務以被引用的為準。
+const QUOTE_TARGET_INTENTS = new Set(["task_stuck", "complete_task", "delete_task", "change_task_type"]);
+
+/**
+ * 決定引用回覆時真正要操作的任務：
+ * - AI 選的 id 裡有被引用的任務 → 保留它
+ * - AI 選了其他任務 → 只有使用者文字明確提到那個任務的名稱，才保留那個任務
+ * - 最後沒有任何任務 → 用被引用的任務（「還沒」「好了」這類短句一定落在這裡）
+ * 這是對 AI 輸出的安全驗證，不是用關鍵字判斷意圖。
+ */
+async function resolveQuotedTarget(db, uid, text, quotedTask, aiIds) {
+  const quotedId = Number(quotedTask.id);
+  const others = aiIds.filter(id => id !== quotedId);
+  const keep = aiIds.includes(quotedId) ? [quotedId] : [];
+
+  let mentioned = [];
+  if (others.length) {
+    const placeholders = others.map(() => "?").join(",");
+    const rows = await db.prepare(
+      `SELECT id, title FROM tasks WHERE line_user_id=? AND status IN ('pending','paused') AND id IN (${placeholders})`
+    ).bind(uid, ...others).all();
+    mentioned = (rows.results || []).filter(r => textMentionsTask(text, r.title)).map(r => Number(r.id));
+  }
+
+  const ids = [...keep, ...mentioned];
+  if (!ids.length) {
+    return { ids: [quotedId], reason: aiIds.length ? "quoted_overrides_ai" : "quoted_fills_empty" };
+  }
+  return { ids, reason: mentioned.length ? (keep.length ? "quoted_plus_mentioned" : "explicit_mention_override") : "quoted_confirmed" };
+}
+
+/**
+ * 使用者文字是否明確提到這個任務：
+ * 名稱 ≤ 3 字要完整出現；較長的名稱要有連續約 6 成（3–6 字）出現，例如「繳電話費」↔「電話費」。
+ */
+function textMentionsTask(text, title) {
+  const norm = v => String(v || "").toLowerCase().replace(/[\s\p{P}\p{S}]/gu, "");
+  const s = norm(text);
+  const t = norm(title);
+  if (t.length < 2 || !s) return false;
+  if (s.includes(t)) return true;
+  const need = t.length <= 3 ? t.length : Math.min(6, Math.max(3, Math.ceil(t.length * 0.6)));
+  if (need < t.length) {
+    for (let i = 0; i + need <= t.length; i++) {
+      if (s.includes(t.slice(i, i + need))) return true;
+    }
+  }
+  return false;
 }
 
 async function findQuotedTask(db, uid, quotedMessageId) {

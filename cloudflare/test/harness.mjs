@@ -147,11 +147,18 @@ export async function setup() {
   const net = new FakeNetwork();
   globalThis.fetch = (input, init) => net.fetch(input, init);
   const queue = [];
+  const queueControl = { failures: 0 };
   const env = {
     DB: db,
     GEMINI_QUEUE: {
-      async sendBatch(msgs) { for (const m of msgs) queue.push(m.body); },
-      async send(body) { queue.push(body); }
+      async sendBatch(msgs) {
+        if (queueControl.failures > 0) { queueControl.failures -= 1; throw new Error("simulated queue outage"); }
+        for (const m of msgs) queue.push(m.body);
+      },
+      async send(body) {
+        if (queueControl.failures > 0) { queueControl.failures -= 1; throw new Error("simulated queue outage"); }
+        queue.push(body);
+      }
     },
     CHANNEL_SECRET: "secret",
     CHANNEL_ACCESS_TOKEN: "token",
@@ -163,7 +170,18 @@ export async function setup() {
 
   let seq = 0;
   const h = {
-    worker, db, net, env, queue,
+    worker, db, net, env, queue, queueControl,
+
+    /** 送 webhook，但「不等」waitUntil 的背景工作：用來確認回 200 之前已經做完的事。 */
+    async webhookNoWait(events) {
+      const raw = JSON.stringify({ destination: "x", events });
+      const signature = createHmac("sha256", env.CHANNEL_SECRET).update(raw).digest("base64");
+      const background = [];
+      const res = await worker.fetch(new Request("https://worker.test/webhook", {
+        method: "POST", headers: { "x-line-signature": signature, "content-type": "application/json" }, body: raw
+      }), env, { waitUntil: p => background.push(p) });
+      return { status: res.status, background };
+    },
 
     async request(method, pathname, { headers = {}, body } = {}) {
       const pending = [];

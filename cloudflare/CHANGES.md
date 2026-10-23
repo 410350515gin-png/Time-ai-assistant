@@ -78,11 +78,26 @@
 
 ---
 
-## 測試（`cloudflare/test/`，41 項全數通過）
+## 測試（`cloudflare/test/`，49 項全數通過）
 
 用 Node 內建的 SQLite 模擬 D1（bind `undefined` 會跟真的 D1 一樣報錯），並攔截 LINE 和 Gemini 的 HTTP 呼叫，整個 Worker 從 webhook 跑到 cron 做端對端測試。在 UTC 和 America/New_York 兩種主機時區下都通過。
 
 涵蓋：成功路徑、重複 webhook、Gemini 503 / 400 換模型、LINE push 500 → retry 只補送、409 視為成功、D1 失敗 → 改走 queue、queue retry 不重做 AI、兩個提醒同時、cron 重疊、claim 過期重新搶、「還沒」情境、引用回覆、模糊短句不猜、卡住狀態機、截止前不迴圈、first_step 進度、例行任務完成與第一次提醒、recurrence（1/31 加一個月、閏年、隔週、台北週日深夜但 UTC 還是週六、錯過多次、until）、沒有時區的 ISO、晚間回顧凌晨完成、22:30 與 22:31 不重複、push 失敗重試、pending 過期、舊按鈕、存檔前重新驗證、一句話兩個提醒、權限隔離（別人的 task id）、舊資料庫升級。
+
+---
+
+## PR #1 review 修正（GPT 驗收後）
+
+| 分級 | 問題 | 修法（function） | 測試 |
+|---|---|---|---|
+| P0 | Inline Fast Path 先回 200 再用 `waitUntil` 處理；inline 和 fallback 進 Queue 都失敗時，事件會遺失 | `handleLineWebhook()` 改成回應前 `await Promise.allSettled(settleInline(...))`。`settleInline()`（取代原本的 `runInline`）必須確定「已處理完」或「已進 Queue」；兩者都失敗就 reject，webhook 回 **503** 讓 LINE 重送。處理超過 `INLINE_BUDGET_MS`（2.5 秒）也會先送進 Queue 當保險，原處理在背景繼續跑 | `[review P0] inline 失敗 + 進 Queue 也失敗 → webhook 回 5xx…`、`[review P0] inline 失敗但成功進 Queue…`、`[review P0] inline 成功 → 回 200 之前已經處理完並回覆`、`[review P0] inline 處理超過時間上限…` |
+| P1 | `beginEvent()` 的 stale lease 接手是「先判斷、再 UPDATE」，兩個 worker 可能同時接手 | 改成單一條件式 `UPDATE … WHERE status='processing' AND 租約已過期 RETURNING event_id`，只有拿到 RETURNING 的 worker 能處理，其他的照「處理中」對待（queue 稍後重試、inline 略過） | `[review P1] 兩個 processor 同時接手同一個 stale event → 只有一個成功，副作用只執行一次`（3 個 processor 同時跑） |
+| P1 | 引用回覆只在 AI 沒選任務時才使用；AI 選錯就會動到錯的任務 | `resolveQuotedTarget()` + `textMentionsTask()`：有引用時被引用的任務優先；AI 選了別的任務，只有使用者文字明確提到那個任務的名稱才保留。適用 `task_stuck / complete_task / delete_task / change_task_type`。結果記在 `AI decision` log 的 `quote_resolution` | `[review P1] 引用 B + AI 誤選 A + 使用者短句「還沒」→ 只會動到 B`、`[review P1] 引用 B 但文字明確提到 A → 允許改成 A`、`[review P1] 引用 B + AI 選 A 和 B，但只提到 B 的情境 → 只完成 B` |
+
+另外：
+- 修正一個跟執行時刻有關的測試（例行任務完成）：原本半夜跑會失敗，現在固定在台灣時間中午。
+- 新增 `.github/workflows/worker-checks.yml`：PR 上會自動跑 `npm test` 與 `npm run check`（wrangler dry-run）。
+- 新增 `cloudflare/.gitignore`。
 
 ---
 
