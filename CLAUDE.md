@@ -26,3 +26,4 @@
 - 有副作用的流程要可以重做：事件走 `webhook_events` 狀態機；提醒和晚間回顧走 claim → send → sent；push 帶決定性的 `X-Line-Retry-Key`。
 - 改 schema 時同步更新 `SCHEMA_STATEMENTS` / `SCHEMA_ALTERS` 和 `cloudflare/schema.sql`，必須可以重複執行。
 - 不要把使用者原文、任務標題寫進 log。
+- **Webhook 回應前只能等「送進 Queue」**：LINE 約 2.2 秒就斷線。不要在 webhook 回應前等 D1 查詢、LINE API 或 AI；唯一例外是 Queue 不可用時的 inline 嘗試，硬上限 800ms。

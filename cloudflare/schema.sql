@@ -5,6 +5,7 @@
 CREATE TABLE IF NOT EXISTS webhook_events (
   event_id TEXT PRIMARY KEY,
   status TEXT NOT NULL DEFAULT 'done',
+  owner TEXT,
   reply_json TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT
